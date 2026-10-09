@@ -1,0 +1,693 @@
+# Changes from m2-many-clients to m3-commands   (generated with: diff -ruN m2-many-clients m3-commands)
+# Lines starting with + were added, - were removed. READMEs and CHANGES.diff are excluded.
+diff -ruN -x README.md -x CHANGES.diff -x out m2-many-clients/PROTOCOL.md m3-commands/PROTOCOL.md
+--- m2-many-clients/PROTOCOL.md	1970-01-01 00:00:00.000000000 +0000
++++ m3-commands/PROTOCOL.md	2026-10-09 17:44:48.894721065 +0000
+@@ -0,0 +1,142 @@
++# Chat protocol specification — version M3
++
++This is the written spec required by milestone M3. It is meant to be shared with the
++other groups: if your server or client follows it, it talks to ours.
++
++The words MUST, SHOULD and MAY are used as in RFCs: MUST is required for
++interoperability, SHOULD is strongly recommended, MAY is optional.
++
++## 1. Transport
++
++The protocol runs over **TCP**. The default server port is **12345** (every program
++accepts `--port` to change it; the class should agree on one number). The server
++listens on all network interfaces, not only on `127.0.0.1`.
++
++## 2. Framing
++
++TCP is a byte stream with no message boundaries, so the protocol adds its own:
++
++- Every message is **one JSON object followed by one line feed** (`\n`, byte `0x0A`).
++- A sender MUST NOT put a raw line feed inside a message. This is automatic: JSON
++  writes a newline inside a string as the two characters `\n`.
++- A receiver MUST keep a buffer, because one `recv()` can return part of a message
++  or several messages at once. It cuts a message at every `0x0A` and keeps the rest.
++- A receiver MUST accept `\r\n` as well as `\n` (Windows clients) and MUST ignore
++  empty lines.
++
++## 3. Encoding
++
++All text is **UTF-8**. Non-ASCII characters MAY be sent as raw UTF-8 (`"olá"`) or as
++JSON escapes (`"ol\u00e1"`, Python's default); a receiver MUST accept both.
++Our programs send raw UTF-8. A receiver SHOULD split lines on the byte `0x0A`
++*before* decoding UTF-8, because TCP can cut a multi-byte character in two.
++
++## 4. Messages
++
++Every message is a JSON object with a string field `"type"`.
++
++- A receiver MUST ignore fields it does not know (this lets the protocol grow).
++- Field order does not matter. Whitespace between JSON tokens is allowed.
++- Our server matches `type` without regard to case (`"msg"` = `"MSG"`), but
++  everybody SHOULD send upper case.
++
++### Client → server (requests)
++
++| type | fields | meaning | reply |
++|---|---|---|---|
++| `NICK` | `nick`: string | register a nickname; must be the first request | `OK`, or `ERROR` 400/409 |
++| `MSG` | `text`: string | send `text` to everyone | `OK` (and a `CHAT` to everyone), or `ERROR` |
++| `PRIV` | `to`: string, `text`: string | send `text` only to user `to` (the `/msg` command) | `OK`, or `ERROR` 404 |
++| `LIST` | — | ask who is online | `USERS` |
++| `QUIT` | — | leave cleanly | `OK`, then the server closes the connection |
++
++### Server → client
++
++| type | fields | meaning |
++|---|---|---|
++| `OK` | — | the last request was accepted |
++| `ERROR` | `code`: integer, `reason`: string | the last request was refused (section 6) |
++| `USERS` | `nicks`: array of strings | reply to `LIST`, in join order |
++| `CHAT` | `from`: string, `text`: string, `private`: boolean | a message to display |
++| `EVENT` | `text`: string | a notice to display, e.g. `"rui joined"`, `"rui left"` |
++
++## 5. Semantics
++
++**Replies vs notifications.** `OK`, `USERS` and `ERROR` are *replies*.
++`CHAT` and `EVENT` are *notifications* and can arrive at any moment, also between a
++request and its reply.
++
++**One reply per request, in order.** The server answers every request with exactly
++one reply, in the order the requests were received. A client can therefore tell
++which request an `ERROR` refers to without any request id.
++
++**Registration.** Before a successful `NICK`, the server answers every request except
++`NICK` and `QUIT` with `ERROR 401`. After a failed `NICK` the client may try another
++nick on the same connection. A second `NICK` after success is refused (`400`).
++
++**Nicknames.** 1 to 20 characters; letters and digits of any alphabet (`joão`, `zé`),
++`_` and `-`. No spaces (the `/msg <nick> <text>` command needs the space as separator).
++Leading/trailing spaces are removed. Nicks are unique **ignoring case**:
++if `Ana` is online, `ana` gets `409`. The server shows the nick as it was typed.
++
++**MSG.** The server replies `OK` to the sender and then sends
++`{"type":"CHAT","from":<sender>,"text":...,"private":false}` to **every** registered
++client, **including the sender**. The sender's own copy shows that the message went
++through the server and in which order everyone sees it.
++
++**PRIV.** The recipient is looked up ignoring case. The recipient gets a `CHAT` with
++`"private":true`; the sender gets only `OK` (its client prints the message locally).
++Sending to yourself is allowed.
++
++**EVENT.** When a client registers, every registered client (the new one included)
++gets `"<nick> joined"`. When a registered client leaves for any reason (QUIT, closed
++socket, crash) the others get `"<nick> left"`.
++
++**QUIT.** The server replies `OK`, then closes the connection. Anything sent after
++`QUIT` is ignored. Closing the socket without `QUIT` is also fine.
++
++## 6. Error codes
++
++The codes are borrowed from HTTP, so their meaning is familiar.
++
++| code | when |
++|---|---|
++| 400 | line is not JSON, not an object, no `type`, unknown `type`, missing/invalid field, invalid nick, second `NICK` |
++| 401 | a request other than `NICK`/`QUIT` before registration |
++| 404 | `PRIV` to a nick that is not online |
++| 409 | nick already taken |
++
++After an `ERROR` the connection stays open: newline framing lets both sides
++continue with the next line, so one bad message never kills a session.
++
++## 7. Example session
++
++`C:` is what the client sends, `S:` what the server sends (each line ends with `\n`).
++
++```
++C: {"type":"NICK","nick":"ana"}
++S: {"type":"OK"}
++S: {"type":"EVENT","text":"ana joined"}
++C: {"type":"MSG","text":"olá a todos"}
++S: {"type":"OK"}
++S: {"type":"CHAT","from":"ana","text":"olá a todos","private":false}
++C: {"type":"PRIV","to":"nobody","text":"hi"}
++S: {"type":"ERROR","code":404,"reason":"no such user: nobody"}
++C: {"type":"LIST"}
++S: {"type":"USERS","nicks":["ana","rui"]}
++C: {"type":"QUIT"}
++S: {"type":"OK"}
++   (server closes the connection)
++```
++
++## 8. Interoperability notes
++
++What we **accept** (be liberal): `\r\n`, empty lines, any whitespace inside JSON,
++`\uXXXX` escapes, unknown fields, lower-case `type`.
++
++What we **send** (be strict): compact JSON, `"type"` first, raw UTF-8, one `\n`.
++
++Our client never *waits* for a specific reply; it prints whatever arrives and shows
++unknown message types raw. So it still works with a server that, for example,
++does not send `OK` after `MSG` or does not echo the sender's own `CHAT`.
++These are the points to agree on with the other groups before testing together.
+diff -ruN -x README.md -x CHANGES.diff -x out m2-many-clients/src/ChatClient.java m3-commands/src/ChatClient.java
+--- m2-many-clients/src/ChatClient.java	2026-10-09 17:42:37.955161660 +0000
++++ m3-commands/src/ChatClient.java	2026-10-09 17:44:23.236589138 +0000
+@@ -9,24 +9,29 @@
+ import java.util.Map;
+ 
+ /**
+- * M2 chat client (M1 + shows EVENT join/leave notices).
++ * M3 chat client: commands /list, /msg, /nick, /quit, /help.
+  *
+  * Two threads:
+  *   - main thread:     reads the keyboard and SENDS (only this thread writes);
+  *   - receiver thread: READS the socket and prints what arrives.
+- * A single thread could not do both, because reading the keyboard blocks
+- * and messages from the server must appear while you are typing.
++ *
++ * The client never waits for a particular reply: it prints whatever arrives.
++ * That keeps it working with servers of other groups whose replies differ a bit.
+  *
+  * Usage: java -cp out ChatClient [--host 127.0.0.1] [--port 12345] [--nick ana]
+  */
+ public class ChatClient {
+ 
++    private static final String HELP =
++            "Commands: /list   /msg <nick> <text>   /nick <name>   /quit   /help\n"
++            + "Anything else is sent to everyone.";
++
+     /** True between sending NICK and receiving its answer. */
+     private static volatile boolean waitingForNickReply = false;
+-    /** Set when WE close the socket, so the receiver does not report an error. */
++    /** Set when WE end the session, so the receiver does not report an error. */
+     private static volatile boolean quitting = false;
+ 
+-    public static void main(String[] args) throws IOException {
++    public static void main(String[] args) throws Exception {
+         Cli cli = new Cli(args);
+         String host = cli.get("host", "127.0.0.1");
+         int port = cli.getInt("port", 12345);
+@@ -40,29 +45,55 @@
+         }
+ 
+         Socket socket = new Socket(host, port);
+-        System.out.println("Connected to " + socket.getRemoteSocketAddress()
+-                + ". Type a message and press Enter. /nick <name>, /quit");
++        System.out.println("Connected to " + socket.getRemoteSocketAddress() + "\n" + HELP);
+         OutputStream out = socket.getOutputStream();
+ 
+         Thread receiver = new Thread(() -> receiveLoop(socket), "receiver");
+         receiver.setDaemon(true);
+         receiver.start();
+ 
+-        send(out, Protocol.nick(nick.strip()));
+         waitingForNickReply = true;
++        send(out, Protocol.nick(nick.strip()));
+ 
+         String line;
+         while ((line = keyboard.readLine()) != null) {
+             if (line.isBlank()) continue;
+-            if (line.equals("/quit")) break;
+-            if (line.startsWith("/nick ")) {
+-                send(out, Protocol.nick(line.substring(6).strip()));
+-                waitingForNickReply = true;
+-            } else {
++            if (!line.startsWith("/")) {
+                 send(out, Protocol.msg(line));
++                continue;
++            }
++            String[] parts = line.split(" ", 3);            // "/msg", "rui", "text with spaces"
++            switch (parts[0]) {
++                case "/list":
++                    send(out, Protocol.list());
++                    break;
++                case "/msg":
++                    if (parts.length < 3 || parts[2].isBlank()) {
++                        System.out.println("usage: /msg <nick> <text>");
++                    } else {
++                        send(out, Protocol.priv(parts[1], parts[2]));
++                        System.out.println("[you -> " + parts[1] + "] " + parts[2]);
++                    }
++                    break;
++                case "/nick":
++                    if (parts.length < 2) {
++                        System.out.println("usage: /nick <name>");
++                    } else {
++                        waitingForNickReply = true;
++                        send(out, Protocol.nick(parts[1]));
++                    }
++                    break;
++                case "/quit":
++                    quitting = true;
++                    send(out, Protocol.quit());
++                    receiver.join(2000);                    // server answers OK and closes
++                    socket.close();
++                    return;
++                default:
++                    System.out.println(HELP);
+             }
+         }
+-        quitting = true;
++        quitting = true;                                    // Ctrl+D: just close
+         socket.close();
+     }
+ 
+@@ -83,11 +114,11 @@
+                     display(line);
+                 }
+             }
+-            System.out.println("*** server closed the connection");
++            if (!quitting) System.out.println("*** server closed the connection");
+         } catch (IOException e) {
+             if (!quitting) System.out.println("*** connection lost: " + e.getMessage());
+         }
+-        System.exit(0);   // the main thread is stuck reading the keyboard; end the program
++        if (!quitting) System.exit(0);   // main thread is blocked on the keyboard: end the program
+     }
+ 
+     /** Prints one server message. Unknown messages are shown raw, never dropped. */
+@@ -102,17 +133,33 @@
+         String type = String.valueOf(msg.get("type")).toUpperCase(Locale.ROOT);
+         switch (type) {
+             case "CHAT":
+-                System.out.println("[" + msg.get("from") + "] " + msg.get("text"));
++                if (Boolean.TRUE.equals(msg.get("private"))) {
++                    System.out.println("[" + msg.get("from") + " -> you] " + msg.get("text"));
++                } else {
++                    System.out.println("[" + msg.get("from") + "] " + msg.get("text"));
++                }
+                 break;
+             case "OK":
+                 if (waitingForNickReply) {
+                     waitingForNickReply = false;
+                     System.out.println("*** nickname accepted");
+                 }
+-                break;   // other OKs only confirm a MSG; the CHAT echo already shows it
++                break;
+             case "EVENT":
+                 System.out.println("*** " + msg.get("text"));
+                 break;
++            case "USERS":
++                Object nicks = msg.get("nicks");
++                System.out.println("*** online: " + (nicks instanceof java.util.List<?> list
++                        ? String.join(", ", list.stream().map(String::valueOf).toList()) : nicks));
++                break;
++            case "ERROR":
++                System.out.println("!!! error " + msg.get("code") + ": " + msg.get("reason"));
++                if (waitingForNickReply) {
++                    waitingForNickReply = false;
++                    System.out.println("    choose another nickname with /nick <name>");
++                }
++                break;
+             default:
+                 System.out.println("<<< " + line);
+         }
+diff -ruN -x README.md -x CHANGES.diff -x out m2-many-clients/src/ChatServer.java m3-commands/src/ChatServer.java
+--- m2-many-clients/src/ChatServer.java	2026-10-09 17:42:37.942825324 +0000
++++ m3-commands/src/ChatServer.java	2026-10-09 17:43:44.270657029 +0000
+@@ -5,26 +5,30 @@
+ import java.time.LocalTime;
+ import java.time.format.DateTimeFormatter;
+ import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
++import java.util.Map;
+ 
+ /**
+- * M2 - Many clients.
++ * M3 - Commands.
+  *
+- * What is new compared to M1:
+- *   - accept() loop starts ONE THREAD PER CLIENT (ClientHandler), so many
+- *     clients are served at the same time;
+- *   - a shared list of registered clients, protected by a lock;
+- *   - MSG is broadcast to everyone; "ana joined" / "ana left" EVENT notices.
++ * What is new compared to M2:
++ *   - the client list became a MAP nick -> client, which gives
++ *       * unique nicknames (atomic check-and-insert under the lock),
++ *       * fast lookup of the recipient of a private message (PRIV);
++ *   - LIST, PRIV, QUIT; ERROR replies with codes (see Protocol / PROTOCOL.md).
+  *
+  * Usage: java -cp out ChatServer [--port 12345]
+  */
+ public class ChatServer {
+ 
+     /**
+-     * Clients that already sent NICK. Every client thread reads and changes this
+-     * list, so EVERY access is inside synchronized (clients) { ... }.
++     * Registered clients, key = nick in lower case ("Ana" and "ana" are the same
++     * person, otherwise impersonation is trivial). LinkedHashMap keeps join order
++     * for LIST. EVERY access is inside synchronized (clients) { ... }.
+      */
+-    private final List<ClientHandler> clients = new ArrayList<>();
++    private final Map<String, ClientHandler> clients = new LinkedHashMap<>();
+     private final int port;
+ 
+     public static void main(String[] args) throws IOException {
+@@ -40,60 +44,75 @@
+         try (ServerSocket server = new ServerSocket()) {
+             server.setReuseAddress(true);
+             server.bind(new InetSocketAddress(port));
+-            log("listening on TCP port " + port + " (M2: one thread per client)");
++            log("listening on TCP port " + port + " (M3: commands)");
+             while (true) {
+-                Socket socket = server.accept();             // main thread only accepts...
++                Socket socket = server.accept();
+                 ClientHandler handler = new ClientHandler(this, socket);
+-                new Thread(handler, "client-" + socket.getRemoteSocketAddress()).start(); // ...each client gets its own thread
++                new Thread(handler, "client-" + socket.getRemoteSocketAddress()).start();
+             }
+         }
+     }
+ 
++    private static String key(String nick) {
++        return nick.toLowerCase(Locale.ROOT);
++    }
++
+     /**
+-     * Adds a client that just chose its nickname.
+-     * The OK is sent while we still hold the lock: no broadcast can reach the new
+-     * client before its OK, so OK is always the first reply it gets to NICK.
++     * Tries to give 'nick' to 'client'. Check, insert and OK happen under ONE lock:
++     * two clients asking for "ana" at the same instant cannot both succeed,
++     * and OK is always the first thing the new client receives.
++     * @return false if the nick is already taken
+      */
+-    void register(ClientHandler client) {
++    boolean register(ClientHandler client, String nick) {
+         synchronized (clients) {
+-            clients.add(client);
++            if (clients.containsKey(key(nick))) return false;
++            client.setNick(nick);
++            clients.put(key(nick), client);
+             client.send(Protocol.ok());
+         }
+-        log(client.nick() + " joined (" + count() + " online)");
+-        broadcast(Protocol.event(client.nick() + " joined"));
++        log(nick + " joined (" + nicks().size() + " online)");
++        broadcast(Protocol.event(nick + " joined"));
++        return true;
+     }
+ 
+     /** Removes a client (safe to call even if it never registered). */
+     void unregister(ClientHandler client) {
+-        boolean wasRegistered;
++        String nick = client.nick();
++        if (nick == null) return;
++        boolean removed;
+         synchronized (clients) {
+-            wasRegistered = clients.remove(client);
++            removed = clients.remove(key(nick), client);
+         }
+-        if (wasRegistered) {
+-            log(client.nick() + " left (" + count() + " online)");
+-            broadcast(Protocol.event(client.nick() + " left"));
++        if (removed) {
++            log(nick + " left (" + nicks().size() + " online)");
++            broadcast(Protocol.event(nick + " left"));
+         }
+     }
+ 
+-    /**
+-     * Sends a message to every registered client (the sender included).
+-     * We COPY the list under the lock and send OUTSIDE the lock:
+-     *   - the list may change while we iterate (someone joins/leaves) -> the copy is stable;
+-     *   - sending can be slow; holding the lock meanwhile would freeze every other thread.
+-     */
+-    void broadcast(String json) {
+-        List<ClientHandler> snapshot;
++    /** The client using this nick (any letter case), or null. */
++    ClientHandler find(String nick) {
+         synchronized (clients) {
+-            snapshot = new ArrayList<>(clients);
++            return clients.get(key(nick));
+         }
+-        for (ClientHandler c : snapshot) {
+-            c.send(json);
++    }
++
++    /** Nicks of all registered clients, in join order. */
++    List<String> nicks() {
++        List<String> result = new ArrayList<>();
++        synchronized (clients) {
++            for (ClientHandler c : clients.values()) result.add(c.nick());
+         }
++        return result;
+     }
+ 
+-    private int count() {
++    /** Sends to every registered client: copy under the lock, send outside it. */
++    void broadcast(String json) {
++        List<ClientHandler> snapshot;
+         synchronized (clients) {
+-            return clients.size();
++            snapshot = new ArrayList<>(clients.values());
++        }
++        for (ClientHandler c : snapshot) {
++            c.send(json);
+         }
+     }
+ 
+diff -ruN -x README.md -x CHANGES.diff -x out m2-many-clients/src/ClientHandler.java m3-commands/src/ClientHandler.java
+--- m2-many-clients/src/ClientHandler.java	2026-10-09 17:42:37.943871869 +0000
++++ m3-commands/src/ClientHandler.java	2026-10-09 17:43:44.271641111 +0000
+@@ -8,15 +8,19 @@
+ 
+ /**
+  * One connected client. run() executes in the client's own thread and only READS;
+- * send() may be called by ANY thread (every thread that broadcasts).
++ * send() may be called by ANY thread.
++ *
++ * New in M3: every request gets exactly ONE reply (OK, USERS or ERROR),
++ * and invalid input is answered with ERROR instead of being silently ignored.
+  */
+ final class ClientHandler implements Runnable {
+ 
+     private final ChatServer server;
+     private final Socket socket;
+     private final OutputStream out;
+-    private final String who;                 // "/192.168.1.20:53211", for the log
+-    private volatile String nick;             // null until NICK; read by other threads
++    private final String who;
++    private volatile String nick;             // null until NICK succeeded
++    private boolean quitRequested = false;    // only used by this client's own thread
+ 
+     ClientHandler(ChatServer server, Socket socket) throws IOException {
+         this.server = server;
+@@ -29,23 +33,28 @@
+         return nick;
+     }
+ 
++    void setNick(String nick) {
++        this.nick = nick;
++    }
++
+     @Override
+     public void run() {
+         ChatServer.log(who + " connected");
+-        LineFramer framer = new LineFramer();      // one buffer per client: their bytes never mix
++        LineFramer framer = new LineFramer();
+         byte[] chunk = new byte[4096];
+         try {
+             InputStream in = socket.getInputStream();
+             int n;
+-            while ((n = in.read(chunk)) != -1) {
++            while (!quitRequested && (n = in.read(chunk)) != -1) {
+                 for (String line : framer.feed(chunk, n)) {
+                     handle(line);
++                    if (quitRequested) break;      // ignore anything sent after QUIT
+                 }
+             }
+         } catch (IOException e) {
+             ChatServer.log(who + " connection error: " + e.getMessage());
+         } finally {
+-            server.unregister(this);               // always runs: no "ghost" clients in the list
++            server.unregister(this);
+             close();
+             ChatServer.log(who + " disconnected");
+         }
+@@ -56,51 +65,85 @@
+         try {
+             msg = Json.parseObject(line);
+         } catch (Json.JsonException e) {
+-            ChatServer.log(who + " ignored, not JSON: " + e.getMessage());
++            // Thanks to newline framing the NEXT line is still readable: we can
++            // report the error and keep the connection, no need to disconnect.
++            send(Protocol.error(Protocol.BAD_REQUEST, "bad JSON: " + e.getMessage()));
+             return;
+         }
+         String type = Json.getString(msg, "type");
+-        type = type == null ? "" : type.toUpperCase(Locale.ROOT);
++        if (type == null) {
++            send(Protocol.error(Protocol.BAD_REQUEST, "missing \"type\""));
++            return;
++        }
++        type = type.toUpperCase(Locale.ROOT);       // liberal: "msg" works like "MSG"
+ 
++        if (nick == null && !type.equals("NICK") && !type.equals("QUIT")) {
++            send(Protocol.error(Protocol.NOT_REGISTERED, "send NICK first"));
++            return;
++        }
+         switch (type) {
+-            case "NICK": {
+-                String requested = Json.getString(msg, "nick");
+-                if (nick != null || requested == null || requested.isBlank()) {
+-                    ChatServer.log(who + " ignored NICK (already registered, or empty)");
+-                    return;
+-                }
+-                nick = requested.strip();
+-                server.register(this);
+-                break;
+-            }
+-            case "MSG": {
+-                String text = Json.getString(msg, "text");
+-                if (nick == null || text == null) {
+-                    ChatServer.log(who + " ignored MSG (no NICK yet, or no text)");
+-                    return;
+-                }
++            case "NICK": handleNick(msg); break;
++            case "MSG":  handleMsg(msg);  break;
++            case "PRIV": handlePriv(msg); break;
++            case "LIST": send(Protocol.users(server.nicks())); break;
++            case "QUIT":
+                 send(Protocol.ok());
+-                server.broadcast(Protocol.chat(nick, text, false));
++                quitRequested = true;               // run() closes the connection
+                 break;
+-            }
+             default:
+-                ChatServer.log(who + " ignored unknown type '" + type + "'");
++                send(Protocol.error(Protocol.BAD_REQUEST, "unknown type '" + type + "'"));
+         }
+     }
+ 
+-    /**
+-     * Writes one message (JSON + "\n").
+-     * synchronized: two threads may broadcast to this client at the same moment;
+-     * without the lock their bytes could interleave and corrupt the framing.
+-     */
++    private void handleNick(Map<String, Object> msg) {
++        if (nick != null) {
++            send(Protocol.error(Protocol.BAD_REQUEST, "already registered as " + nick));
++            return;
++        }
++        String requested = Json.getString(msg, "nick");
++        if (requested != null) requested = requested.strip();
++        String problem = Protocol.checkName(requested);
++        if (problem != null) {
++            send(Protocol.error(Protocol.BAD_REQUEST, "invalid nick: " + problem));
++        } else if (!server.register(this, requested)) {
++            send(Protocol.error(Protocol.NICK_TAKEN, "nick taken"));
++        }
++        // on success register() already sent OK
++    }
++
++    private void handleMsg(Map<String, Object> msg) {
++        String text = Json.getString(msg, "text");
++        if (text == null || text.isBlank()) {
++            send(Protocol.error(Protocol.BAD_REQUEST, "\"text\" must be a non-empty string"));
++            return;
++        }
++        send(Protocol.ok());
++        server.broadcast(Protocol.chat(nick, text, false));
++    }
++
++    private void handlePriv(Map<String, Object> msg) {
++        String to = Json.getString(msg, "to");
++        String text = Json.getString(msg, "text");
++        if (to == null || text == null || text.isBlank()) {
++            send(Protocol.error(Protocol.BAD_REQUEST, "PRIV needs \"to\" and a non-empty \"text\""));
++            return;
++        }
++        ClientHandler target = server.find(to.strip());
++        if (target == null) {
++            send(Protocol.error(Protocol.NO_SUCH_USER, "no such user: " + to));
++            return;
++        }
++        target.send(Protocol.chat(nick, text, true));
++        send(Protocol.ok());
++    }
++
++    /** Writes one message; synchronized so concurrent senders never interleave bytes. */
+     synchronized void send(String json) {
+         try {
+             out.write((json + "\n").getBytes(StandardCharsets.UTF_8));
+             out.flush();
+         } catch (IOException e) {
+-            // The client is gone. Closing the socket makes our reader thread
+-            // leave its loop, and its finally{} removes us from the list.
+-            close();
++            close();   // our reader thread will notice and clean up
+         }
+     }
+ 
+diff -ruN -x README.md -x CHANGES.diff -x out m2-many-clients/src/Protocol.java m3-commands/src/Protocol.java
+--- m2-many-clients/src/Protocol.java	2026-10-09 17:42:37.955046202 +0000
++++ m3-commands/src/Protocol.java	2026-10-09 17:43:44.269616157 +0000
+@@ -1,23 +1,38 @@
++import java.util.List;
++
+ /**
+- * The wire format in ONE place. Every message is one JSON object on one line.
+- * Server and client both build their messages here, so a change to the
+- * protocol is a change to this file only.
++ * The wire format in ONE place (see PROTOCOL.md for the full specification).
++ * Every message is one JSON object on one line, UTF-8, ending with "\n".
+  *
+- * M1 messages:
+  *   client -> server   NICK  {"type":"NICK","nick":"ana"}
+  *   client -> server   MSG   {"type":"MSG","text":"hello"}
++ *   client -> server   PRIV  {"type":"PRIV","to":"rui","text":"hi"}          (new in M3)
++ *   client -> server   LIST  {"type":"LIST"}                                 (new in M3)
++ *   client -> server   QUIT  {"type":"QUIT"}                                 (new in M3)
+  *   server -> client   OK    {"type":"OK"}
+  *   server -> client   CHAT  {"type":"CHAT","from":"ana","text":"hello","private":false}
+- * New in M2:
++ *   server -> client   USERS {"type":"USERS","nicks":["ana","rui"]}          (new in M3)
+  *   server -> client   EVENT {"type":"EVENT","text":"rui joined"}
++ *   server -> client   ERROR {"type":"ERROR","code":409,"reason":"nick taken"} (new in M3)
+  */
+ final class Protocol {
+ 
+     private Protocol() { }
+ 
++    // Error codes: borrowed from HTTP, so everybody already knows what they mean.
++    static final int BAD_REQUEST = 400;      // not JSON, unknown type, missing/invalid field
++    static final int NOT_REGISTERED = 401;   // anything except NICK/QUIT before NICK succeeded
++    static final int NO_SUCH_USER = 404;     // PRIV to a nick that is not online
++    static final int NICK_TAKEN = 409;       // somebody already uses this nick
++
++    static final int MAX_NAME_LENGTH = 20;
++
+     // client -> server
+     static String nick(String nick) { return Json.write(Json.obj("type", "NICK", "nick", nick)); }
+     static String msg(String text)  { return Json.write(Json.obj("type", "MSG", "text", text)); }
++    static String priv(String to, String text) { return Json.write(Json.obj("type", "PRIV", "to", to, "text", text)); }
++    static String list() { return Json.write(Json.obj("type", "LIST")); }
++    static String quit() { return Json.write(Json.obj("type", "QUIT")); }
+ 
+     // server -> client
+     static String ok() { return Json.write(Json.obj("type", "OK")); }
+@@ -27,4 +42,24 @@
+     }
+ 
+     static String event(String text) { return Json.write(Json.obj("type", "EVENT", "text", text)); }
++
++    static String users(List<String> nicks) { return Json.write(Json.obj("type", "USERS", "nicks", nicks)); }
++
++    static String error(int code, String reason) {
++        return Json.write(Json.obj("type", "ERROR", "code", code, "reason", reason));
++    }
++
++    /**
++     * Nickname rule. Returns null if the name is valid, otherwise the reason.
++     * Letters and digits of ANY alphabet are allowed (joão, zé, Ελένη), plus '_' and '-'.
++     * No spaces: "/msg <nick> <text>" uses the first space to separate nick and text.
++     */
++    static String checkName(String name) {
++        if (name == null || name.isEmpty()) return "must not be empty";
++        if (name.codePointCount(0, name.length()) > MAX_NAME_LENGTH) {
++            return "must be at most " + MAX_NAME_LENGTH + " characters";
++        }
++        boolean ok = name.codePoints().allMatch(c -> Character.isLetterOrDigit(c) || c == '_' || c == '-');
++        return ok ? null : "only letters, digits, '_' and '-' are allowed";
++    }
+ }

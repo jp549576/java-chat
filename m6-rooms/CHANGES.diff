@@ -1,0 +1,449 @@
+# Changes from m5-discovery to m6-rooms   (generated with: diff -ruN m5-discovery m6-rooms)
+# Lines starting with + were added, - were removed. READMEs and CHANGES.diff are excluded.
+diff -ruN -x README.md -x CHANGES.diff -x out m5-discovery/PROTOCOL.md m6-rooms/PROTOCOL.md
+--- m5-discovery/PROTOCOL.md	2026-10-09 17:55:08.842514111 +0000
++++ m6-rooms/PROTOCOL.md	2026-10-09 17:57:09.653252409 +0000
+@@ -1,8 +1,8 @@
+-# Chat protocol specification — version M5
++# Chat protocol specification — version M6 (final)
+ 
+ This is the written spec required by milestone M3, updated in M4
+ (section 6 codes 408/413/500, section 7 limits and shutdown) and in M5
+-(section 10, UDP discovery). The TCP protocol did not change in M5. It is meant to be shared with the
++(section 10, UDP discovery) and in M6 (section 11, chat rooms). It is meant to be shared with the
+ other groups: if your server or client follows it, it talks to ours.
+ 
+ The words MUST, SHOULD and MAY are used as in RFCs: MUST is required for
+@@ -212,3 +212,41 @@
+ on the same subnet. University and hotel Wi-Fi often block broadcast or isolate
+ clients from each other; a phone hotspot or a lab switch works. The macOS firewall
+ must allow incoming connections for `java`. TCP still works with `--host <ip>`.
++
++## 11. Chat rooms (new in M6, extension C)
++
++**Model.** Every registered client is in exactly **one** room at a time. Everybody
++starts in the room **`lobby`**. A room exists while at least one client is in it;
++there is no command to create or delete rooms.
++
++**Room names** follow the nickname rules (1–20 letters/digits of any alphabet, `_`,
++`-`). A leading `#` is ignored and names are case-insensitive: `#Games` = `games`.
++The server always writes them in lower case, without `#`.
++
++**New requests**
++
++| type | fields | meaning | reply |
++|---|---|---|---|
++| `JOIN` | `room`: string | leave the current room and enter `room` | `OK`, or `ERROR 400` (bad name) |
++| `LEAVE` | — | go back to `lobby` | `OK` |
++
++`JOIN` to the room you are already in, and `LEAVE` while in the lobby, are accepted
++(`OK`) and change nothing.
++
++**Changed behaviour**
++
++- `MSG` reaches only the clients in the **sender's room**. The `CHAT` gets an extra
++  field: `{"type":"CHAT","from":"ana","text":"hi","private":false,"room":"games"}`.
++- `LIST` lists the clients in **your room**; the `USERS` reply gets an extra field:
++  `{"type":"USERS","nicks":["ana","eva"],"room":"games"}`.
++- When a client moves, the old room receives `EVENT "<nick> left #<old>"` and the
++  new room (the client included) receives `EVENT "<nick> joined #<new>"`.
++
++**Unchanged:** `PRIV` works across rooms. Connection notices `"<nick> joined"` /
++`"<nick> left"` (connecting and disconnecting) still go to everybody, so everyone
++knows who is online. All error codes, limits and discovery are as before.
++
++**Backward compatibility.** A client written for section 1–10 never sends `JOIN`,
++so it stays in the lobby, and it ignores the extra `room` fields. It keeps working
++with everyone else in the lobby without any change. This was the main reason for
++choosing this extension: it adds features without breaking anyone.
+diff -ruN -x README.md -x CHANGES.diff -x out m5-discovery/src/ChatClient.java m6-rooms/src/ChatClient.java
+--- m5-discovery/src/ChatClient.java	2026-10-09 17:54:00.329693669 +0000
++++ m6-rooms/src/ChatClient.java	2026-10-09 17:55:59.198583080 +0000
+@@ -10,10 +10,11 @@
+ import java.util.Map;
+ 
+ /**
+- * M5 chat client: commands /list, /msg, /nick, /quit, /help.
++ * M6 chat client: commands /list, /msg, /nick, /join, /leave, /quit, /help.
+  * M4: Ctrl+C sends QUIT before the program ends.
+  * New in M5: without --host the client FINDS servers on the LAN by UDP broadcast
+  * (ServerFinder). --scan only lists them, handy on interop day.
++ * New in M6: /join <room> and /leave; messages show their room.
+  *
+  * Two threads:
+  *   - main thread:     reads the keyboard and SENDS (only this thread writes);
+@@ -28,7 +29,7 @@
+ public class ChatClient {
+ 
+     private static final String HELP =
+-            "Commands: /list   /msg <nick> <text>   /nick <name>   /quit   /help\n"
++            "Commands: /join <room>   /leave   /list   /msg <nick> <text>   /nick <name>   /quit   /help\n"
+             + "Anything else is sent to everyone.";
+ 
+     /** True between sending NICK and receiving its answer. */
+@@ -112,6 +113,16 @@
+                 case "/list":
+                     send(out, Protocol.list());
+                     break;
++                case "/join":
++                    if (parts.length < 2) {
++                        System.out.println("usage: /join <room>");
++                    } else {
++                        send(out, Protocol.join(parts[1]));
++                    }
++                    break;
++                case "/leave":
++                    send(out, Protocol.leave());
++                    break;
+                 case "/msg":
+                     if (parts.length < 3 || parts[2].isBlank()) {
+                         System.out.println("usage: /msg <nick> <text>");
+@@ -185,7 +196,9 @@
+                 if (Boolean.TRUE.equals(msg.get("private"))) {
+                     System.out.println("[" + msg.get("from") + " -> you] " + msg.get("text"));
+                 } else {
+-                    System.out.println("[" + msg.get("from") + "] " + msg.get("text"));
++                    Object room = msg.get("room");               // only M6 servers send it
++                    String prefix = room == null || room.equals(Protocol.DEFAULT_ROOM) ? "" : "#" + room + " ";
++                    System.out.println(prefix + "[" + msg.get("from") + "] " + msg.get("text"));
+                 }
+                 break;
+             case "OK":
+@@ -199,7 +212,8 @@
+                 break;
+             case "USERS":
+                 Object nicks = msg.get("nicks");
+-                System.out.println("*** online: " + (nicks instanceof java.util.List<?> list
++                Object where = msg.get("room");
++                System.out.println("*** online" + (where == null ? "" : " in #" + where) + ": " + (nicks instanceof java.util.List<?> list
+                         ? String.join(", ", list.stream().map(String::valueOf).toList()) : nicks));
+                 break;
+             case "ERROR":
+diff -ruN -x README.md -x CHANGES.diff -x out m5-discovery/src/ChatServer.java m6-rooms/src/ChatServer.java
+--- m5-discovery/src/ChatServer.java	2026-10-09 17:53:49.330598790 +0000
++++ m6-rooms/src/ChatServer.java	2026-10-09 17:55:59.198332903 +0000
+@@ -18,12 +18,15 @@
+ import java.util.logging.Logger;
+ 
+ /**
+- * M5 - UDP discovery.
++ * M6 - Extension C: chat rooms (/join, /leave).
+  *
+- * What is new compared to M4: start() also starts a DiscoveryResponder, which
+- * answers UDP "DISCOVER" datagrams (default UDP port 12346) with our TCP port, so
+- * clients can find this server on the LAN without typing an IP address.
+- * Everything else (M0..M4) is unchanged.
++ * What is new compared to M5:
++ *   - every client has a current room (ClientHandler.room), "lobby" at first;
++ *   - MSG and LIST work inside the sender's room (broadcastToRoom, nicksInRoom);
++ *   - changeRoom() moves a client and tells both rooms.
++ * There is NO separate "rooms" table: a room exists while somebody is in it.
++ * Nothing to create, nothing to delete, nothing that can get out of sync.
++ * Connect/disconnect notices and PRIV still work server-wide, as in M3.
+  *
+  * Usage: java -cp out ChatServer [--port 12345] [--udp-port 12346] [--name my-server]
+  *                                [--idle 300] [--max-line 65536] [--outbox 1000] [--no-log-file]
+@@ -191,6 +194,47 @@
+         }
+         return result;
+     }
++
++    /**
++     * Moves a client to another room. The change and the OK happen under the lock,
++     * like NICK: the client gets OK before any message of its new room.
++     */
++    void changeRoom(ClientHandler client, String newRoom) {
++        String oldRoom;
++        synchronized (clients) {
++            oldRoom = client.room();
++            client.send(Protocol.ok());
++            if (oldRoom.equals(newRoom)) return;         // already there: OK, nothing changes
++            client.setRoom(newRoom);
++        }
++        LOG.info(client.nick() + " moved #" + oldRoom + " -> #" + newRoom);
++        broadcastToRoom(oldRoom, Protocol.event(client.nick() + " left #" + oldRoom));
++        broadcastToRoom(newRoom, Protocol.event(client.nick() + " joined #" + newRoom));
++    }
++
++    /** Like broadcast(), but only to the clients currently in 'room'. */
++    void broadcastToRoom(String room, String json) {
++        List<ClientHandler> snapshot = new ArrayList<>();
++        synchronized (clients) {
++            for (ClientHandler c : clients.values()) {
++                if (c.room().equals(room)) snapshot.add(c);
++            }
++        }
++        for (ClientHandler c : snapshot) {
++            c.send(json);
++        }
++    }
++
++    /** Nicks of the clients in one room, in join order. */
++    List<String> nicksInRoom(String room) {
++        List<String> result = new ArrayList<>();
++        synchronized (clients) {
++            for (ClientHandler c : clients.values()) {
++                if (c.room().equals(room)) result.add(c.nick());
++            }
++        }
++        return result;
++    }
+ 
+     /** Copy under the lock, send outside it. send() only queues, so this never blocks. */
+     void broadcast(String json) {
+diff -ruN -x README.md -x CHANGES.diff -x out m5-discovery/src/ChatTests.java m6-rooms/src/ChatTests.java
+--- m5-discovery/src/ChatTests.java	2026-10-09 17:53:49.331058840 +0000
++++ m6-rooms/src/ChatTests.java	2026-10-09 17:56:17.894356448 +0000
+@@ -58,6 +58,12 @@
+         test("discovery: ServerFinder finds a server on this machine", ChatTests::discoveryFinder);
+         test("discovery: replies in other formats are understood", ChatTests::discoveryParsing);
+ 
++        // --- new in M6
++        test("rooms: MSG only reaches the sender's room", ChatTests::roomsIsolate);
++        test("rooms: JOIN/LEAVE -> OK and notices in both rooms", ChatTests::roomsEvents);
++        test("rooms: LIST lists your room only, PRIV crosses rooms", ChatTests::roomsListAndPriv);
++        test("rooms: invalid or missing room name -> 400", ChatTests::roomsInvalid);
++
+         System.out.println();
+         System.out.println(passed + " passed, " + failed + " failed");
+         System.exit(failed == 0 ? 0 : 1);
+@@ -349,6 +355,61 @@
+         }
+     }
+ 
++    // =================================================================== M6: rooms
++
++    static void roomsIsolate() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana");
++             Client b = Client.registered(s.port, "rui"); Client c = Client.registered(s.port, "eva")) {
++            b.send("type", "JOIN", "room", "#Games");             // '#' and case are ignored
++            checkEquals("OK", b.next("OK").get("type"));
++            a.send("type", "MSG", "text", "lobby only");
++            Map<String, Object> chat = c.next("CHAT");
++            checkEquals("lobby only", chat.get("text"));
++            checkEquals("lobby", chat.get("room"));
++            b.send("type", "MSG", "text", "games only");
++            Map<String, Object> own = b.next("CHAT");
++            checkEquals("games only", own.get("text"));            // b never saw "lobby only"
++            checkEquals("games", own.get("room"));
++            c.send("type", "LIST");
++            check(c.nextUntilType("USERS").stream().noneMatch(m -> "games only".equals(m.get("text"))),
++                    "the lobby must not see messages from #games");
++        }
++    }
++
++    static void roomsEvents() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana"); Client b = Client.registered(s.port, "rui")) {
++            b.send("type", "JOIN", "room", "games");
++            checkEquals("OK", b.next("OK").get("type"));
++            checkEquals("rui joined #games", b.nextEventContaining("#games").get("text"));
++            checkEquals("rui left #lobby", a.nextEventContaining("#lobby").get("text"));
++            b.send("type", "LEAVE");
++            checkEquals("OK", b.next("OK").get("type"));
++            checkEquals("rui joined #lobby", a.nextEventContaining("joined #lobby").get("text"));
++        }
++    }
++
++    static void roomsListAndPriv() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana"); Client b = Client.registered(s.port, "rui")) {
++            b.send("type", "JOIN", "room", "games");
++            b.next("OK");
++            b.send("type", "LIST");
++            Map<String, Object> users = b.next("USERS");
++            checkEquals(List.of("rui"), users.get("nicks"));
++            checkEquals("games", users.get("room"));
++            a.send("type", "PRIV", "to", "rui", "text", "psst");
++            checkEquals("psst", b.next("CHAT").get("text"));
++        }
++    }
++
++    static void roomsInvalid() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana")) {
++            a.send("type", "JOIN", "room", "two words");
++            checkEquals(400L, a.next("ERROR").get("code"));
++            a.send("type", "JOIN");
++            checkEquals(400L, a.next("ERROR").get("code"));
++        }
++    }
++
+     // =================================================================== tiny test framework
+ 
+     interface TestBody {
+diff -ruN -x README.md -x CHANGES.diff -x out m5-discovery/src/ClientHandler.java m6-rooms/src/ClientHandler.java
+--- m5-discovery/src/ClientHandler.java	2026-10-09 17:52:17.700297227 +0000
++++ m6-rooms/src/ClientHandler.java	2026-10-09 17:55:59.198472539 +0000
+@@ -45,6 +45,8 @@
+     private final AtomicBoolean closing = new AtomicBoolean(false);  // no new messages accepted
+     private final AtomicBoolean closed = new AtomicBoolean(false);   // socket closed
+     private volatile String nick;
++    /** Current room (M6). Changed only by ChatServer.changeRoom(), under its lock. */
++    private volatile String room = Protocol.DEFAULT_ROOM;
+     private boolean quitRequested = false;                           // reader thread only
+ 
+     ClientHandler(ChatServer server, Socket socket) {
+@@ -64,6 +66,14 @@
+         this.nick = nick;
+     }
+ 
++    String room() {
++        return room;
++    }
++
++    void setRoom(String room) {
++        this.room = room;
++    }
++
+     // ------------------------------------------------------------------ reader thread
+ 
+     @Override
+@@ -158,7 +168,9 @@
+             case "NICK": handleNick(msg); break;
+             case "MSG":  handleMsg(msg);  break;
+             case "PRIV": handlePriv(msg); break;
+-            case "LIST": send(Protocol.users(server.nicks())); break;
++            case "LIST": send(Protocol.users(server.nicksInRoom(room), room)); break;
++            case "JOIN": handleJoin(msg); break;
++            case "LEAVE": server.changeRoom(this, Protocol.DEFAULT_ROOM); break;
+             case "QUIT":
+                 send(Protocol.ok());
+                 quitRequested = true;
+@@ -190,7 +202,17 @@
+             return;
+         }
+         send(Protocol.ok());
+-        server.broadcast(Protocol.chat(nick, text, false));
++        server.broadcastToRoom(room, Protocol.roomChat(nick, text, room));
++    }
++
++    private void handleJoin(Map<String, Object> msg) {
++        String requested = Protocol.normalizeRoom(Json.getString(msg, "room"));
++        String problem = Protocol.checkName(requested);              // same rules as nicks
++        if (problem != null) {
++            send(Protocol.error(Protocol.BAD_REQUEST, "invalid room: " + problem));
++            return;
++        }
++        server.changeRoom(this, requested);
+     }
+ 
+     private void handlePriv(Map<String, Object> msg) {
+diff -ruN -x README.md -x CHANGES.diff -x out m5-discovery/src/Protocol.java m6-rooms/src/Protocol.java
+--- m5-discovery/src/Protocol.java	2026-10-09 17:52:17.700360679 +0000
++++ m6-rooms/src/Protocol.java	2026-10-09 17:55:59.198144482 +0000
+@@ -14,6 +14,14 @@
+  *   server -> client   USERS {"type":"USERS","nicks":["ana","rui"]}          (new in M3)
+  *   server -> client   EVENT {"type":"EVENT","text":"rui joined"}
+  *   server -> client   ERROR {"type":"ERROR","code":409,"reason":"nick taken"} (new in M3)
++ *
++ * New in M6 (chat rooms):
++ *   client -> server   JOIN  {"type":"JOIN","room":"games"}     move to room "games" -> OK
++ *   client -> server   LEAVE {"type":"LEAVE"}                   back to the lobby    -> OK
++ *   CHAT  from MSG gets an extra field  "room":"games"
++ *   USERS gets an extra field           "room":"games"   (LIST now lists your room)
++ * Old clients ignore unknown fields and never send JOIN, so they keep working:
++ * they simply live in the lobby.
+  */
+ final class Protocol {
+ 
+@@ -29,6 +37,8 @@
+     static final int INTERNAL_ERROR = 500;   // bug in the server; the connection stays open (new in M4)
+ 
+     static final int MAX_NAME_LENGTH = 20;
++    /** Everybody starts here; LEAVE comes back here. */
++    static final String DEFAULT_ROOM = "lobby";
+ 
+     // client -> server
+     static String nick(String nick) { return Json.write(Json.obj("type", "NICK", "nick", nick)); }
+@@ -36,6 +46,8 @@
+     static String priv(String to, String text) { return Json.write(Json.obj("type", "PRIV", "to", to, "text", text)); }
+     static String list() { return Json.write(Json.obj("type", "LIST")); }
+     static String quit() { return Json.write(Json.obj("type", "QUIT")); }
++    static String join(String room) { return Json.write(Json.obj("type", "JOIN", "room", room)); }
++    static String leave() { return Json.write(Json.obj("type", "LEAVE")); }
+ 
+     // server -> client
+     static String ok() { return Json.write(Json.obj("type", "OK")); }
+@@ -44,9 +56,24 @@
+         return Json.write(Json.obj("type", "CHAT", "from", from, "text", text, "private", isPrivate));
+     }
+ 
++    /** A public message inside a room: the M3 CHAT plus a "room" field. */
++    static String roomChat(String from, String text, String room) {
++        return Json.write(Json.obj("type", "CHAT", "from", from, "text", text, "private", false, "room", room));
++    }
++
+     static String event(String text) { return Json.write(Json.obj("type", "EVENT", "text", text)); }
+ 
+-    static String users(List<String> nicks) { return Json.write(Json.obj("type", "USERS", "nicks", nicks)); }
++    static String users(List<String> nicks, String room) {
++        return Json.write(Json.obj("type", "USERS", "nicks", nicks, "room", room));
++    }
++
++    /** "#Games " -> "games". Room names are case-insensitive; we store them in lower case. */
++    static String normalizeRoom(String name) {
++        if (name == null) return null;
++        String n = name.strip();
++        if (n.startsWith("#")) n = n.substring(1);
++        return n.toLowerCase(java.util.Locale.ROOT);
++    }
+ 
+     static String error(int code, String reason) {
+         return Json.write(Json.obj("type", "ERROR", "code", code, "reason", reason));
+diff -ruN -x README.md -x CHANGES.diff -x out m5-discovery/tests/test_protocol.py m6-rooms/tests/test_protocol.py
+--- m5-discovery/tests/test_protocol.py	2026-10-09 17:54:52.466318507 +0000
++++ m6-rooms/tests/test_protocol.py	2026-10-09 17:56:47.169006115 +0000
+@@ -12,6 +12,7 @@
+ 
+ Tests marked "ours" check limits we configured on our own server (idle timeout,
+ size limit); they are skipped automatically when testing someone else's server.
++Tests marked "rooms" (M6) run against another server only with CHAT_ROOMS=1.
+ """
+ import json
+ import os
+@@ -27,6 +28,9 @@
+ EXTERNAL = "CHAT_HOST" in os.environ
+ UDP = {"port": int(os.environ.get("CHAT_UDP_PORT", "12346"))}   # filled in by the fixture
+ ours = pytest.mark.skipif(EXTERNAL, reason="depends on our server's configuration")
++# Rooms are OUR M6 extension; another group may have picked a different one.
++rooms = pytest.mark.skipif(EXTERNAL and os.environ.get("CHAT_ROOMS") != "1",
++                           reason="server may not implement rooms (set CHAT_ROOMS=1 to test)")
+ 
+ 
+ def free_port():
+@@ -250,3 +254,37 @@
+     reply = json.loads(data.decode("utf-8"))
+     assert int(reply["port"]) == tcp_port
+     assert sender[0] == socket.gethostbyname(host)   # the IP comes from the packet itself
++
++
++# ----------------------------------------------------------------- M6: chat rooms
++
++@rooms
++def test_rooms_isolate_messages(connect):
++    a, b = connect(unique("a")), connect(unique("b"))
++    room = unique("room")
++    b.send(type="JOIN", room=room)
++    assert b.recv_type("OK", "ERROR")["type"] == "OK"
++    a.send(type="MSG", text="lobby message")
++    b.send(type="MSG", text="room message")
++    chat = b.recv_type("CHAT")
++    assert chat["text"] == "room message" and chat["room"] == room.lower()
++
++
++@rooms
++def test_rooms_list_shows_only_my_room(connect):
++    b_nick = unique("b")
++    connect(unique("a"))
++    b = connect(b_nick)
++    room = unique("room")
++    b.send(type="JOIN", room="#" + room)
++    b.recv_type("OK")
++    b.send(type="LIST")
++    users = b.recv_type("USERS")
++    assert users["nicks"] == [b_nick] and users["room"] == room.lower()
++
++
++@rooms
++def test_rooms_invalid_name(connect):
++    c = connect(unique("c"))
++    c.send(type="JOIN", room="no spaces allowed")
++    assert c.recv_type("ERROR", "OK")["code"] == 400

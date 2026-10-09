@@ -1,0 +1,1471 @@
+# Changes from m3-commands to m4-robustness   (generated with: diff -ruN m3-commands m4-robustness)
+# Lines starting with + were added, - were removed. READMEs and CHANGES.diff are excluded.
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/PROTOCOL.md m4-robustness/PROTOCOL.md
+--- m3-commands/PROTOCOL.md	2026-10-09 17:44:48.894721065 +0000
++++ m4-robustness/PROTOCOL.md	2026-10-09 17:52:07.068958542 +0000
+@@ -1,6 +1,7 @@
+-# Chat protocol specification — version M3
++# Chat protocol specification — version M4
+ 
+-This is the written spec required by milestone M3. It is meant to be shared with the
++This is the written spec required by milestone M3, updated in M4
++(new: section 6 codes 408/413/500, section 7 limits and shutdown). It is meant to be shared with the
+ other groups: if your server or client follows it, it talks to ours.
+ 
+ The words MUST, SHOULD and MAY are used as in RFCs: MUST is required for
+@@ -104,12 +105,34 @@
+ | 400 | line is not JSON, not an object, no `type`, unknown `type`, missing/invalid field, invalid nick, second `NICK` |
+ | 401 | a request other than `NICK`/`QUIT` before registration |
+ | 404 | `PRIV` to a nick that is not online |
++| 408 | no data received for the idle timeout — **the server then closes** (new in M4) |
+ | 409 | nick already taken |
++| 413 | message longer than the size limit — **the server then closes** (new in M4) |
++| 500 | the server failed while handling the request; connection stays open (new in M4) |
+ 
+-After an `ERROR` the connection stays open: newline framing lets both sides
+-continue with the next line, so one bad message never kills a session.
++After an `ERROR` the connection normally stays open: newline framing lets both
++sides continue with the next line, so one bad message never kills a session.
++The exceptions are 408 and 413: after an oversized message the server cannot know
++where the next message starts, so it closes the connection.
++
++## 7. Limits and connection end (new in M4)
++
++- **Maximum message size: 65 536 bytes** (64 KiB) per line, `\n` excluded.
++  Clients SHOULD stay well below it. Our client accepts up to 1 MiB from servers.
++- **Idle timeout: 300 seconds** by default (`--idle`). A connection on which the
++  server receives nothing for that long gets `ERROR 408` and is closed. The protocol
++  has no keep-alive message; a client that wants to stay connected while idle can
++  send `LIST` from time to time.
++- **Slow clients.** The server queues at most 1 000 messages per client. A client
++  that does not read and lets its queue fill up is disconnected (the others see
++  `"<nick> left"`), so it can never slow down the rest of the chat.
++- **Graceful close.** Before closing, the server sends its last message, then shuts
++  down its sending side (TCP FIN) and reads for up to 1 s more, so that the last
++  message is not destroyed by a TCP reset.
++- **Server shutdown** (Ctrl+C): every client receives
++  `{"type":"EVENT","text":"server shutting down"}` and the connection is closed.
+ 
+-## 7. Example session
++## 8. Example session
+ 
+ `C:` is what the client sends, `S:` what the server sends (each line ends with `\n`).
+ 
+@@ -129,13 +152,16 @@
+    (server closes the connection)
+ ```
+ 
+-## 8. Interoperability notes
++## 9. Interoperability notes
+ 
+ What we **accept** (be liberal): `\r\n`, empty lines, any whitespace inside JSON,
+ `\uXXXX` escapes, unknown fields, lower-case `type`.
+ 
+ What we **send** (be strict): compact JSON, `"type"` first, raw UTF-8, one `\n`.
+ 
++The pytest suite in `tests/` checks all of this over the network and can be run
++against another group's server: `CHAT_HOST=<ip> CHAT_PORT=<port> python3 -m pytest -v tests/`.
++
+ Our client never *waits* for a specific reply; it prints whatever arrives and shows
+ unknown message types raw. So it still works with a server that, for example,
+ does not send `OK` after `MSG` or does not echo the sender's own `CHAT`.
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/src/ChatClient.java m4-robustness/src/ChatClient.java
+--- m3-commands/src/ChatClient.java	2026-10-09 17:44:23.236589138 +0000
++++ m4-robustness/src/ChatClient.java	2026-10-09 17:47:50.053465267 +0000
+@@ -9,7 +9,9 @@
+ import java.util.Map;
+ 
+ /**
+- * M3 chat client: commands /list, /msg, /nick, /quit, /help.
++ * M4 chat client: commands /list, /msg, /nick, /quit, /help.
++ * New in M4: Ctrl+C sends QUIT before the program ends, so the server sees a
++ * clean goodbye instead of a reset connection.
+  *
+  * Two threads:
+  *   - main thread:     reads the keyboard and SENDS (only this thread writes);
+@@ -48,6 +50,18 @@
+         System.out.println("Connected to " + socket.getRemoteSocketAddress() + "\n" + HELP);
+         OutputStream out = socket.getOutputStream();
+ 
++        // Ctrl+C: the JVM runs shutdown hooks before exiting; say goodbye properly.
++        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
++            if (!quitting) {
++                quitting = true;
++                try {
++                    send(out, Protocol.quit());
++                } catch (IOException ignored) {
++                    // connection already gone
++                }
++            }
++        }, "quit-on-ctrl-c"));
++
+         Thread receiver = new Thread(() -> receiveLoop(socket), "receiver");
+         receiver.setDaemon(true);
+         receiver.start();
+@@ -97,7 +111,8 @@
+         socket.close();
+     }
+ 
+-    private static void send(OutputStream out, String json) throws IOException {
++    /** synchronized: the main thread and the Ctrl+C hook may both send. */
++    private static synchronized void send(OutputStream out, String json) throws IOException {
+         out.write((json + "\n").getBytes(StandardCharsets.UTF_8));
+         out.flush();
+     }
+@@ -118,7 +133,10 @@
+         } catch (IOException e) {
+             if (!quitting) System.out.println("*** connection lost: " + e.getMessage());
+         }
+-        if (!quitting) System.exit(0);   // main thread is blocked on the keyboard: end the program
++        if (!quitting) {
++            quitting = true;              // nothing left to say goodbye to
++            System.exit(0);               // main thread is blocked on the keyboard: end the program
++        }
+     }
+ 
+     /** Prints one server message. Unknown messages are shown raw, never dropped. */
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/src/ChatServer.java m4-robustness/src/ChatServer.java
+--- m3-commands/src/ChatServer.java	2026-10-09 17:43:44.270657029 +0000
++++ m4-robustness/src/ChatServer.java	2026-10-09 17:51:15.783002470 +0000
+@@ -2,81 +2,159 @@
+ import java.net.InetSocketAddress;
+ import java.net.ServerSocket;
+ import java.net.Socket;
+-import java.time.LocalTime;
+-import java.time.format.DateTimeFormatter;
+ import java.util.ArrayList;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.logging.ConsoleHandler;
++import java.util.logging.FileHandler;
++import java.util.logging.Formatter;
++import java.util.logging.Handler;
++import java.util.logging.Level;
++import java.util.logging.LogRecord;
++import java.util.logging.Logger;
+ 
+ /**
+- * M3 - Commands.
++ * M4 - Robustness and tests.
+  *
+- * What is new compared to M2:
+- *   - the client list became a MAP nick -> client, which gives
+- *       * unique nicknames (atomic check-and-insert under the lock),
+- *       * fast lookup of the recipient of a private message (PRIV);
+- *   - LIST, PRIV, QUIT; ERROR replies with codes (see Protocol / PROTOCOL.md).
++ * What is new compared to M3:
++ *   - Config (idle timeout, max line size, outbox size) instead of constants;
++ *   - the server is an object with start()/stop(), so tests can run it in-process
++ *     on a random free port (port 0);
++ *   - Ctrl+C runs a shutdown hook: stop accepting, tell every client, close sockets;
++ *   - java.util.logging to the console AND to server.log;
++ *   - ClientHandler: idle timeout, size limit, per-client send queue (see there).
+  *
+- * Usage: java -cp out ChatServer [--port 12345]
++ * Usage: java -cp out ChatServer [--port 12345] [--idle 300] [--max-line 65536]
++ *                                [--outbox 1000] [--no-log-file]
+  */
+ public class ChatServer {
+ 
+-    /**
+-     * Registered clients, key = nick in lower case ("Ana" and "ana" are the same
+-     * person, otherwise impersonation is trivial). LinkedHashMap keeps join order
+-     * for LIST. EVERY access is inside synchronized (clients) { ... }.
+-     */
+-    private final Map<String, ClientHandler> clients = new LinkedHashMap<>();
+-    private final int port;
++    static final Logger LOG = Logger.getLogger("chat");
+ 
+-    public static void main(String[] args) throws IOException {
+-        Cli cli = new Cli(args);
+-        new ChatServer(cli.getInt("port", 12345)).run();
+-    }
++    /** All tunable settings in one place. Tests use small values. */
++    record Config(int port, int idleTimeoutSeconds, int maxLineBytes, int outboxLimit) { }
+ 
+-    ChatServer(int port) {
+-        this.port = port;
+-    }
++    private final Config config;
++    /** Registered clients, key = nick in lower case. Guarded by synchronized (clients). */
++    private final Map<String, ClientHandler> clients = new LinkedHashMap<>();
++    /** EVERY open connection, also before NICK, so stop() can close them all. */
++    private final Set<ClientHandler> connections = ConcurrentHashMap.newKeySet();
++    private ServerSocket serverSocket;
++    private Thread acceptThread;
++    private volatile boolean running;
+ 
+-    void run() throws IOException {
+-        try (ServerSocket server = new ServerSocket()) {
+-            server.setReuseAddress(true);
+-            server.bind(new InetSocketAddress(port));
+-            log("listening on TCP port " + port + " (M3: commands)");
+-            while (true) {
+-                Socket socket = server.accept();
++    public static void main(String[] args) throws Exception {
++        Cli cli = new Cli(args);
++        Config config = new Config(
++                cli.getInt("port", 12345),
++                cli.getInt("idle", 300),
++                cli.getInt("max-line", 64 * 1024),
++                cli.getInt("outbox", 1000));
++        setupLogging(!cli.has("no-log-file"));
++
++        ChatServer server = new ChatServer(config);
++        server.start();
++        // Ctrl+C (SIGINT) or "kill" (SIGTERM): the JVM runs shutdown hooks before exiting.
++        // Printed directly: java.util.logging has its own shutdown hook that may already
++        // have closed the log handlers (hooks run in parallel, in no fixed order).
++        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
++            System.err.println("Shutdown requested (Ctrl+C or kill): closing all connections...");
++            server.stop();
++            System.err.println("bye");
++        }, "shutdown"));
++        server.acceptThread.join();
++    }
++
++    ChatServer(Config config) {
++        this.config = config;
++    }
++
++    Config config() {
++        return config;
++    }
++
++    /** Binds the port and starts the accept thread; returns immediately. */
++    void start() throws IOException {
++        serverSocket = new ServerSocket();
++        serverSocket.setReuseAddress(true);
++        serverSocket.bind(new InetSocketAddress(config.port()));
++        running = true;
++        acceptThread = new Thread(this::acceptLoop, "accept");
++        acceptThread.start();
++        LOG.info("listening on TCP port " + port() + " (M4: idle timeout " + config.idleTimeoutSeconds()
++                + " s, max line " + config.maxLineBytes() + " bytes)");
++    }
++
++    /** The real port, useful when started with port 0 ("any free port"). */
++    int port() {
++        return serverSocket.getLocalPort();
++    }
++
++    private void acceptLoop() {
++        while (running) {
++            try {
++                Socket socket = serverSocket.accept();
+                 ClientHandler handler = new ClientHandler(this, socket);
++                connections.add(handler);
++                if (!running) {                          // stop() ran while we were accepting:
++                    handler.closeNow();                  // don't leak this last connection
++                    break;
++                }
+                 new Thread(handler, "client-" + socket.getRemoteSocketAddress()).start();
++            } catch (IOException e) {
++                if (!running) break;                     // stop() closed the socket: normal exit
++                LOG.warning("accept failed: " + e.getMessage());
++                sleep(100);                              // e.g. "too many open files": don't spin
+             }
+         }
+     }
+ 
++    /** Clean shutdown: stop accepting, tell every client, give writers a moment, close. */
++    void stop() {
++        if (!running) return;
++        running = false;
++        LOG.info("stopping: closing " + connections.size() + " connection(s)");
++        try {
++            serverSocket.close();                        // unblocks accept()
++        } catch (IOException ignored) {
++            // already closed
++        }
++        for (ClientHandler c : connections) {
++            c.sendAndClose(Protocol.event("server shutting down"));
++        }
++        long deadline = System.currentTimeMillis() + 1500;
++        for (ClientHandler c : connections) {
++            c.awaitFinished(Math.max(1, deadline - System.currentTimeMillis()));
++            c.closeNow();
++        }
++    }
++
++    // ------------------------------------------------------------------ client registry
++
+     private static String key(String nick) {
+         return nick.toLowerCase(Locale.ROOT);
+     }
+ 
+-    /**
+-     * Tries to give 'nick' to 'client'. Check, insert and OK happen under ONE lock:
+-     * two clients asking for "ana" at the same instant cannot both succeed,
+-     * and OK is always the first thing the new client receives.
+-     * @return false if the nick is already taken
+-     */
++    /** Check + insert + OK under ONE lock (see M3). @return false if the nick is taken */
+     boolean register(ClientHandler client, String nick) {
+         synchronized (clients) {
+             if (clients.containsKey(key(nick))) return false;
+             client.setNick(nick);
+             clients.put(key(nick), client);
+-            client.send(Protocol.ok());
++            client.send(Protocol.ok());                  // only queues: never blocks under the lock
+         }
+-        log(nick + " joined (" + nicks().size() + " online)");
++        LOG.info(nick + " joined (" + nicks().size() + " online)");
+         broadcast(Protocol.event(nick + " joined"));
+         return true;
+     }
+ 
+-    /** Removes a client (safe to call even if it never registered). */
+-    void unregister(ClientHandler client) {
++    /** Called by a ClientHandler when its connection is over, whatever the reason. */
++    void connectionEnded(ClientHandler client) {
++        connections.remove(client);
+         String nick = client.nick();
+         if (nick == null) return;
+         boolean removed;
+@@ -84,19 +162,17 @@
+             removed = clients.remove(key(nick), client);
+         }
+         if (removed) {
+-            log(nick + " left (" + nicks().size() + " online)");
++            LOG.info(nick + " left (" + nicks().size() + " online)");
+             broadcast(Protocol.event(nick + " left"));
+         }
+     }
+ 
+-    /** The client using this nick (any letter case), or null. */
+     ClientHandler find(String nick) {
+         synchronized (clients) {
+             return clients.get(key(nick));
+         }
+     }
+ 
+-    /** Nicks of all registered clients, in join order. */
+     List<String> nicks() {
+         List<String> result = new ArrayList<>();
+         synchronized (clients) {
+@@ -105,7 +181,7 @@
+         return result;
+     }
+ 
+-    /** Sends to every registered client: copy under the lock, send outside it. */
++    /** Copy under the lock, send outside it. send() only queues, so this never blocks. */
+     void broadcast(String json) {
+         List<ClientHandler> snapshot;
+         synchronized (clients) {
+@@ -116,8 +192,37 @@
+         }
+     }
+ 
+-    static void log(String text) {
+-        System.out.println(LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss.SSS"))
+-                + " [" + Thread.currentThread().getName() + "] " + text);
++    // ------------------------------------------------------------------ logging
++
++    /** One line per record, to the terminal and (optionally) appended to server.log. */
++    static void setupLogging(boolean toFile) throws IOException {
++        Formatter oneLine = new Formatter() {
++            @Override
++            public String format(LogRecord r) {
++                return String.format("%1$tF %1$tT.%1$tL %2$-7s [%3$s] %4$s%n",
++                        r.getMillis(), r.getLevel(), Thread.currentThread().getName(), r.getMessage());
++            }
++        };
++        Logger root = Logger.getLogger("");
++        for (Handler h : root.getHandlers()) root.removeHandler(h);   // drop the 2-line default format
++        Handler console = new ConsoleHandler();
++        console.setEncoding("UTF-8");
++        console.setFormatter(oneLine);
++        root.addHandler(console);
++        if (toFile) {
++            Handler file = new FileHandler("server.log", true);     // true = append
++            file.setEncoding("UTF-8");
++            file.setFormatter(oneLine);
++            root.addHandler(file);
++        }
++        root.setLevel(Level.INFO);
++    }
++
++    private static void sleep(long ms) {
++        try {
++            Thread.sleep(ms);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
+     }
+ }
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/src/ChatTests.java m4-robustness/src/ChatTests.java
+--- m3-commands/src/ChatTests.java	1970-01-01 00:00:00.000000000 +0000
++++ m4-robustness/src/ChatTests.java	2026-10-09 17:50:11.349651129 +0000
+@@ -0,0 +1,443 @@
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.Socket;
++import java.net.SocketTimeoutException;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayDeque;
++import java.util.Arrays;
++import java.util.Deque;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++
++/**
++ * Automated tests, with NO external library (JUnit is not in the standard library).
++ * Each test starts its own ChatServer in this JVM on a free port (port 0), talks to it
++ * through real TCP sockets, and stops it. Run with ./test.sh; exit code 0 = all passed.
++ *
++ * The same protocol checks also exist for pytest in tests/test_protocol.py; those can
++ * be pointed at ANY group's server.
++ */
++public class ChatTests {
++
++    private static int passed = 0;
++    private static int failed = 0;
++
++    public static void main(String[] args) {
++        Logger.getLogger("").setLevel(System.getenv("TEST_LOG") != null ? Level.INFO : Level.OFF);  // TEST_LOG=1 ./test.sh shows server logs
++
++        // --- unit tests: no network
++        test("framer: partial, merged, CRLF and empty lines", ChatTests::framerBasics);
++        test("framer: UTF-8 character split between two reads", ChatTests::framerSplitUtf8);
++        test("framer: line above the limit is rejected", ChatTests::framerLimit);
++        test("json: Python-style input (spaces, \\u escapes, emoji)", ChatTests::jsonFromPython);
++        test("json: output escapes newlines and never spans two lines", ChatTests::jsonWrite);
++        test("json: invalid input and absurd nesting are rejected", ChatTests::jsonInvalid);
++
++        // --- protocol tests: real server, real sockets
++        test("NICK -> OK first, then 'joined' EVENT", ChatTests::nickOk);
++        test("duplicate nick (any case) -> 409, invalid nick -> 400", ChatTests::nickErrors);
++        test("request before NICK -> 401", ChatTests::notRegistered);
++        test("MSG -> OK to sender, CHAT to everyone", ChatTests::broadcast);
++        test("PRIV -> only the recipient, unknown user -> 404", ChatTests::privateMessage);
++        test("LIST -> USERS with every nick", ChatTests::list);
++        test("bad JSON / unknown type -> 400 and the connection survives", ChatTests::badInput);
++        test("server reassembles partial and merged messages", ChatTests::partialAndMerged);
++        test("abrupt disconnect -> others get 'left', server keeps working", ChatTests::abruptDisconnect);
++        test("QUIT -> OK, then the server closes", ChatTests::quit);
++        test("idle client -> ERROR 408 and disconnected", ChatTests::idleTimeout);
++        test("oversized message -> ERROR 413 and disconnected", ChatTests::lineTooLong);
++        test("a client that never reads cannot block the others", ChatTests::slowConsumer);
++        test("stop() (Ctrl+C) notifies and closes every client", ChatTests::shutdown);
++
++        System.out.println();
++        System.out.println(passed + " passed, " + failed + " failed");
++        System.exit(failed == 0 ? 0 : 1);
++    }
++
++    // =================================================================== unit tests
++
++    static void framerBasics() throws Exception {
++        LineFramer f = new LineFramer();
++        check(feed(f, "{\"a\":").isEmpty(), "partial line must not be returned");
++        checkEquals(List.of("{\"a\":1}", "{\"b\":2}"), feed(f, "1}\n{\"b\":2}\r\n\n{\"c\""));
++        checkEquals(List.of("{\"c\":3}"), feed(f, ":3}\n"));
++        checkEquals(0, f.pending());
++    }
++
++    static void framerSplitUtf8() throws Exception {
++        LineFramer f = new LineFramer();
++        byte[] all = "olá😀\n".getBytes(StandardCharsets.UTF_8);
++        int cut = 5;                                              // inside the emoji
++        check(f.feed(Arrays.copyOfRange(all, 0, cut), cut).isEmpty(), "no line yet");
++        byte[] rest = Arrays.copyOfRange(all, cut, all.length);
++        checkEquals(List.of("olá😀"), f.feed(rest, rest.length));
++    }
++
++    static void framerLimit() throws Exception {
++        LineFramer f = new LineFramer(10);
++        feed(f, "0123456789");                                    // exactly 10: still fine
++        try {
++            feed(f, "X");
++            throw new AssertionError("expected LineTooLongException");
++        } catch (LineFramer.LineTooLongException expected) {
++            // ok
++        }
++    }
++
++    static void jsonFromPython() throws Exception {
++        // what Python's json.dumps({"type": "MSG", "text": "olá 😀"}) produces:
++        Map<String, Object> m = Json.parseObject("{\"type\": \"MSG\", \"text\": \"ol\\u00e1 \\ud83d\\ude00\", \"n\": -1.5e2}");
++        checkEquals("MSG", m.get("type"));
++        checkEquals("olá 😀", m.get("text"));
++        checkEquals(-150.0, m.get("n"));
++    }
++
++    static void jsonWrite() throws Exception {
++        String s = Json.write(Json.obj("type", "MSG", "text", "a\nb\"c\\", "list", List.of(1, true)));
++        checkEquals("{\"type\":\"MSG\",\"text\":\"a\\nb\\\"c\\\\\",\"list\":[1,true]}", s);
++        check(s.indexOf('\n') < 0, "no raw newline");
++        checkEquals("a\nb\"c\\", Json.parseObject(s).get("text"));
++    }
++
++    static void jsonInvalid() {
++        for (String bad : new String[]{"", "{", "{\"a\"}", "{\"a\":1,}", "[1 2]", "{\"a\":tru}", "\"x\" y",
++                "[".repeat(1000) + "]".repeat(1000)}) {
++            try {
++                Json.parse(bad);
++                throw new AssertionError("accepted invalid JSON: " + bad);
++            } catch (Json.JsonException expected) {
++                // ok
++            }
++        }
++    }
++
++    // =================================================================== protocol tests
++
++    static void nickOk() throws Exception {
++        try (Server s = new Server(); Client a = new Client(s.port)) {
++            a.send("type", "NICK", "nick", "ana");
++            checkEquals("OK", a.next().get("type"));             // OK must be the FIRST thing
++            checkEquals("ana joined", a.next("EVENT").get("text"));
++        }
++    }
++
++    static void nickErrors() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "Ana"); Client b = new Client(s.port)) {
++            b.send("type", "NICK", "nick", "ANA");
++            checkEquals(409L, b.next("ERROR").get("code"));
++            b.send("type", "NICK", "nick", "has space");
++            checkEquals(400L, b.next("ERROR").get("code"));
++            b.send("type", "NICK", "nick", "joão");                // non-ASCII letters are fine
++            checkEquals("OK", b.next().get("type"));
++        }
++    }
++
++    static void notRegistered() throws Exception {
++        try (Server s = new Server(); Client a = new Client(s.port)) {
++            a.send("type", "MSG", "text", "hi");
++            checkEquals(401L, a.next("ERROR").get("code"));
++        }
++    }
++
++    static void broadcast() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana"); Client b = Client.registered(s.port, "rui")) {
++            a.send("type", "MSG", "text", "olá");
++            checkEquals("OK", a.next("OK").get("type"));
++            Map<String, Object> toA = a.next("CHAT");
++            Map<String, Object> toB = b.next("CHAT");
++            checkEquals("ana", toB.get("from"));
++            checkEquals("olá", toB.get("text"));
++            checkEquals(false, toB.get("private"));
++            checkEquals(toB, toA);                                // sender gets the same copy
++        }
++    }
++
++    static void privateMessage() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana");
++             Client b = Client.registered(s.port, "rui"); Client c = Client.registered(s.port, "eva")) {
++            a.send("type", "PRIV", "to", "RUI", "text", "segredo");
++            checkEquals("OK", a.next("OK").get("type"));
++            Map<String, Object> chat = b.next("CHAT");
++            checkEquals(true, chat.get("private"));
++            checkEquals("segredo", chat.get("text"));
++            a.send("type", "PRIV", "to", "nobody", "text", "x");
++            checkEquals(404L, a.next("ERROR").get("code"));
++            c.send("type", "LIST");                               // c's next CHAT would be wrong:
++            check(c.nextUntilType("USERS").stream().noneMatch(m -> "CHAT".equals(m.get("type"))),
++                    "a third client must not see the private message");
++        }
++    }
++
++    static void list() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana"); Client b = Client.registered(s.port, "rui")) {
++            b.send("type", "LIST");
++            checkEquals(List.of("ana", "rui"), b.next("USERS").get("nicks"));
++        }
++    }
++
++    static void badInput() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana")) {
++            a.sendRaw("this is not json\n");
++            checkEquals(400L, a.next("ERROR").get("code"));
++            a.send("type", "DANCE");
++            checkEquals(400L, a.next("ERROR").get("code"));
++            a.sendRaw("[1,2,3]\n");
++            checkEquals(400L, a.next("ERROR").get("code"));
++            a.send("type", "LIST");                                // still alive
++            checkEquals("USERS", a.next("USERS").get("type"));
++        }
++    }
++
++    static void partialAndMerged() throws Exception {
++        try (Server s = new Server(); Client a = new Client(s.port)) {
++            a.socket.setTcpNoDelay(true);
++            for (byte b : "{\"type\":\"NICK\",\"nick\":\"zé\"}\n".getBytes(StandardCharsets.UTF_8)) {
++                a.out.write(b);                                    // one byte per segment
++                a.out.flush();
++            }
++            checkEquals("OK", a.next().get("type"));
++            a.sendRaw("{\"type\":\"MSG\",\"text\":\"1\"}\n{\"type\":\"MSG\",\"text\":\"2\"}\n");  // one write
++            checkEquals("1", a.next("CHAT").get("text"));
++            checkEquals("2", a.next("CHAT").get("text"));
++        }
++    }
++
++    static void abruptDisconnect() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana")) {
++            Client b = Client.registered(s.port, "rui");
++            b.socket.setSoLinger(true, 0);                         // close() sends RST: a "crash"
++            b.socket.close();
++            checkEquals("rui left", a.nextEventContaining("left").get("text"));
++            try (Client c = Client.registered(s.port, "rui")) {  // nick is free again
++                c.send("type", "LIST");
++                checkEquals(List.of("ana", "rui"), c.next("USERS").get("nicks"));
++            }
++        }
++    }
++
++    static void quit() throws Exception {
++        try (Server s = new Server(); Client a = Client.registered(s.port, "ana"); Client b = Client.registered(s.port, "rui")) {
++            b.send("type", "QUIT");
++            checkEquals("OK", b.next("OK").get("type"));
++            check(b.closedWithin(2000), "server must close after QUIT");
++            checkEquals("rui left", a.nextEventContaining("left").get("text"));
++        }
++    }
++
++    static void idleTimeout() throws Exception {
++        try (Server s = new Server(1, 65536, 1000); Client a = Client.registered(s.port, "ana")) {
++            checkEquals(408L, a.next("ERROR").get("code"));
++            check(a.closedWithin(2000), "server must close after the idle timeout");
++        }
++    }
++
++    static void lineTooLong() throws Exception {
++        try (Server s = new Server(30, 1000, 1000); Client a = Client.registered(s.port, "ana")) {
++            a.sendRaw("{\"type\":\"MSG\",\"text\":\"" + "x".repeat(5000) + "\"}\n");
++            checkEquals(413L, a.next("ERROR").get("code"));
++            check(a.closedWithin(2000), "server must close after 413");
++        }
++    }
++
++    static void slowConsumer() throws Exception {
++        try (Server s = new Server(30, 65536, 100); Client fast = Client.registered(s.port, "fast")) {
++            // A "frozen" client: tiny receive buffer, and it never reads.
++            Socket frozen = new Socket();
++            frozen.setReceiveBufferSize(1024);
++            frozen.connect(new java.net.InetSocketAddress("127.0.0.1", s.port));
++            frozen.getOutputStream().write("{\"type\":\"NICK\",\"nick\":\"frozen\"}\n".getBytes(StandardCharsets.UTF_8));
++
++            // 'fast' floods the room and must still receive every one of its CHATs back.
++            AtomicInteger chats = new AtomicInteger();
++            AtomicInteger frozenLeft = new AtomicInteger();
++            Thread readerThread = new Thread(() -> {
++                try {
++                    while (true) {
++                        Map<String, Object> m = fast.next();
++                        if ("CHAT".equals(m.get("type"))) chats.incrementAndGet();
++                        if ("frozen left".equals(m.get("text"))) frozenLeft.incrementAndGet();
++                    }
++                } catch (Throwable ignored) {
++                    // socket closed at the end of the test
++                }
++            });
++            readerThread.setDaemon(true);
++            readerThread.start();
++
++            // Keep sending until the server gives up on 'frozen'. 'fast' paces itself like a
++            // real client (waits for its own echoes), so 'fast' itself is never "too slow".
++            String big = "y".repeat(2000);
++            int sent = 0;
++            while (frozenLeft.get() == 0 && sent < 20000) {
++                fast.send("type", "MSG", "text", big);
++                sent++;
++                if (sent % 10 == 0) waitUntil(chats, sent, 5000);
++            }
++            waitUntil(chats, sent, 5000);
++            check(frozenLeft.get() == 1, "the frozen client must have been disconnected");
++            checkEquals(sent, chats.get());                        // fast got every single echo
++            frozen.close();
++        }
++    }
++
++    static void shutdown() throws Exception {
++        Server s = new Server();
++        try (Client a = Client.registered(s.port, "ana"); Client b = new Client(s.port)) {
++            s.server.stop();
++            checkEquals("server shutting down", a.nextEventContaining("shutting").get("text"));
++            check(a.closedWithin(2000), "registered client closed");
++            check(b.closedWithin(2000), "unregistered client closed too");
++        }
++    }
++
++    // =================================================================== tiny test framework
++
++    interface TestBody {
++        void run() throws Exception;
++    }
++
++    static void test(String name, TestBody body) {
++        try {
++            body.run();
++            passed++;
++            System.out.println("PASS  " + name);
++        } catch (Throwable e) {
++            failed++;
++            System.out.println("FAIL  " + name + "\n      " + e);
++        }
++    }
++
++    static void check(boolean condition, String what) {
++        if (!condition) throw new AssertionError(what);
++    }
++
++    static void checkEquals(Object expected, Object actual) {
++        if (!java.util.Objects.equals(expected, actual)) {
++            throw new AssertionError("expected <" + expected + "> but got <" + actual + ">");
++        }
++    }
++
++    static void waitUntil(AtomicInteger counter, int atLeast, long millis) throws InterruptedException {
++        long end = System.currentTimeMillis() + millis;
++        while (counter.get() < atLeast && System.currentTimeMillis() < end) Thread.sleep(5);
++    }
++
++    static List<String> feed(LineFramer f, String s) throws IOException {
++        byte[] b = s.getBytes(StandardCharsets.UTF_8);
++        return f.feed(b, b.length);
++    }
++
++    /** A server in this JVM on a random free port. */
++    static final class Server implements AutoCloseable {
++        final ChatServer server;
++        final int port;
++
++        Server() throws IOException {
++            this(30, 65536, 1000);
++        }
++
++        Server(int idleSeconds, int maxLine, int outbox) throws IOException {
++            server = new ChatServer(new ChatServer.Config(0, idleSeconds, maxLine, outbox));
++            server.start();
++            port = server.port();
++        }
++
++        @Override
++        public void close() {
++            server.stop();
++        }
++    }
++
++    /** A raw test client: sends JSON lines and reads replies through its own LineFramer. */
++    static final class Client implements AutoCloseable {
++        final Socket socket;
++        final OutputStream out;
++        final InputStream in;
++        final LineFramer framer = new LineFramer();
++        final Deque<Map<String, Object>> inbox = new ArrayDeque<>();
++
++        Client(int port) throws IOException {
++            socket = new Socket("127.0.0.1", port);
++            socket.setSoTimeout(3000);                             // a test never hangs forever
++            out = socket.getOutputStream();
++            in = socket.getInputStream();
++        }
++
++        static Client registered(int port, String nick) throws Exception {
++            Client c = new Client(port);
++            c.send("type", "NICK", "nick", nick);
++            checkEquals("OK", c.next().get("type"));
++            return c;
++        }
++
++        void send(Object... keysAndValues) throws IOException {
++            sendRaw(Json.write(Json.obj(keysAndValues)) + "\n");
++        }
++
++        synchronized void sendRaw(String s) throws IOException {
++            out.write(s.getBytes(StandardCharsets.UTF_8));
++            out.flush();
++        }
++
++        /** The next message from the server (fails on timeout or closed connection). */
++        Map<String, Object> next() throws Exception {
++            byte[] chunk = new byte[65536];
++            while (inbox.isEmpty()) {
++                int n = in.read(chunk);
++                if (n == -1) throw new AssertionError("connection closed by server");
++                for (String line : framer.feed(chunk, n)) inbox.add(Json.parseObject(line));
++            }
++            return inbox.poll();
++        }
++
++        /** Skips messages until one of this type arrives. */
++        Map<String, Object> next(String type) throws Exception {
++            while (true) {
++                Map<String, Object> m = next();
++                if (type.equals(m.get("type"))) return m;
++            }
++        }
++
++        /** Returns all messages up to and including the first one of this type. */
++        List<Map<String, Object>> nextUntilType(String type) throws Exception {
++            List<Map<String, Object>> seen = new java.util.ArrayList<>();
++            while (true) {
++                Map<String, Object> m = next();
++                seen.add(m);
++                if (type.equals(m.get("type"))) return seen;
++            }
++        }
++
++        Map<String, Object> nextEventContaining(String word) throws Exception {
++            while (true) {
++                Map<String, Object> m = next("EVENT");
++                if (String.valueOf(m.get("text")).contains(word)) return m;
++            }
++        }
++
++        /** True if the server closes the connection within the given time. */
++        boolean closedWithin(int millis) throws IOException {
++            socket.setSoTimeout(millis);
++            byte[] chunk = new byte[4096];
++            try {
++                while (in.read(chunk) != -1) {
++                    // discard
++                }
++                return true;
++            } catch (SocketTimeoutException e) {
++                return false;
++            } catch (IOException e) {
++                return true;                                       // reset also means closed
++            }
++        }
++
++        @Override
++        public void close() throws IOException {
++            socket.close();
++        }
++    }
++}
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/src/ClientHandler.java m4-robustness/src/ClientHandler.java
+--- m3-commands/src/ClientHandler.java	2026-10-09 17:43:44.271641111 +0000
++++ m4-robustness/src/ClientHandler.java	2026-10-09 17:47:41.499717380 +0000
+@@ -2,31 +2,58 @@
+ import java.io.InputStream;
+ import java.io.OutputStream;
+ import java.net.Socket;
++import java.net.SocketTimeoutException;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Locale;
+ import java.util.Map;
++import java.util.concurrent.ArrayBlockingQueue;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.logging.Level;
++import java.util.logging.Logger;
+ 
+ /**
+- * One connected client. run() executes in the client's own thread and only READS;
+- * send() may be called by ANY thread.
++ * One connected client, now with TWO threads:
+  *
+- * New in M3: every request gets exactly ONE reply (OK, USERS or ERROR),
+- * and invalid input is answered with ERROR instead of being silently ignored.
++ *   reader thread (run):  reads the socket, handles requests, owns the final close;
++ *   writer thread:        takes messages from this client's OUTBOX queue and writes them.
++ *
++ * Why the outbox (new in M4)? In M3, broadcast() wrote directly to every socket.
++ * If one client stops reading (frozen laptop, full Wi-Fi buffer), write() blocks
++ * forever and the thread that was broadcasting -- i.e. some OTHER client -- freezes.
++ * Java sockets have a read timeout (setSoTimeout) but no write timeout, so we cannot
++ * just "use a timeout" when sending. Now send() only puts the message in a bounded
++ * queue and returns immediately. If the queue is full, that client is too slow and
++ * is disconnected; nobody else is affected.
++ *
++ * Also new: idle timeout (ERROR 408), size limit (ERROR 413), quiet handling of
++ * abrupt disconnects, ERROR 500 instead of a dead thread if handling a message
++ * throws, and a graceful close that does not lose the last message.
+  */
+ final class ClientHandler implements Runnable {
+ 
++    private static final Logger LOG = ChatServer.LOG;
++    /** "Poison pill": when the writer takes this exact object, it finishes. */
++    private static final String END_OF_OUTPUT = new String("<end>");
++
+     private final ChatServer server;
+     private final Socket socket;
+-    private final OutputStream out;
+     private final String who;
+-    private volatile String nick;             // null until NICK succeeded
+-    private boolean quitRequested = false;    // only used by this client's own thread
++    private final BlockingQueue<String> outbox;
++    private final Thread writer;
++    private volatile Thread reader;
++    private final AtomicBoolean closing = new AtomicBoolean(false);  // no new messages accepted
++    private final AtomicBoolean closed = new AtomicBoolean(false);   // socket closed
++    private volatile String nick;
++    private boolean quitRequested = false;                           // reader thread only
+ 
+-    ClientHandler(ChatServer server, Socket socket) throws IOException {
++    ClientHandler(ChatServer server, Socket socket) {
+         this.server = server;
+         this.socket = socket;
+-        this.out = socket.getOutputStream();
+         this.who = String.valueOf(socket.getRemoteSocketAddress());
++        this.outbox = new ArrayBlockingQueue<>(server.config().outboxLimit());
++        this.writer = new Thread(this::writeLoop, "writer-" + who);
++        this.writer.setDaemon(true);
+     }
+ 
+     String nick() {
+@@ -37,26 +64,74 @@
+         this.nick = nick;
+     }
+ 
++    // ------------------------------------------------------------------ reader thread
++
+     @Override
+     public void run() {
+-        ChatServer.log(who + " connected");
+-        LineFramer framer = new LineFramer();
+-        byte[] chunk = new byte[4096];
++        reader = Thread.currentThread();
++        writer.start();
++        LOG.info(who + " connected");
+         try {
+-            InputStream in = socket.getInputStream();
+-            int n;
+-            while (!quitRequested && (n = in.read(chunk)) != -1) {
+-                for (String line : framer.feed(chunk, n)) {
++            // read() now gives up after this many ms without data -> SocketTimeoutException
++            socket.setSoTimeout(server.config().idleTimeoutSeconds() * 1000);
++            readLoop();                                   // returns on EOF or after QUIT
++            finish(null);
++        } catch (SocketTimeoutException e) {
++            LOG.info(who + " idle for " + server.config().idleTimeoutSeconds() + " s, disconnecting");
++            finish(Protocol.error(Protocol.IDLE_TIMEOUT, "idle timeout"));
++        } catch (LineFramer.LineTooLongException e) {
++            LOG.warning(who + " " + e.getMessage() + ", disconnecting");
++            // We cannot find the start of the next message any more: report and close.
++            finish(Protocol.error(Protocol.LINE_TOO_LONG, e.getMessage()));
++        } catch (IOException e) {
++            // Abrupt disconnect ("Connection reset", "Broken pipe") or we closed the socket.
++            // Normal life for a server: one INFO line, no stack trace.
++            if (!closed.get()) LOG.info(who + " connection lost: " + e.getMessage());
++        } finally {
++            server.connectionEnded(this);                 // unregister + "<nick> left"
++            if (closing.get()) awaitWriter(1000);         // graceful end: let queued messages go out
++            closeNow();
++            LOG.info(who + " disconnected");
++        }
++    }
++
++    private void readLoop() throws IOException {
++        LineFramer framer = new LineFramer(server.config().maxLineBytes());
++        InputStream in = socket.getInputStream();
++        byte[] chunk = new byte[4096];
++        int n;
++        while ((n = in.read(chunk)) != -1) {
++            for (String line : framer.feed(chunk, n)) {
++                try {
+                     handle(line);
+-                    if (quitRequested) break;      // ignore anything sent after QUIT
++                } catch (RuntimeException bug) {
++                    // A bug while handling ONE message must not kill the whole connection.
++                    LOG.log(Level.SEVERE, who + " internal error on: " + line, bug);
++                    send(Protocol.error(Protocol.INTERNAL_ERROR, "internal server error"));
+                 }
++                if (quitRequested) return;                // ignore anything after QUIT
+             }
+-        } catch (IOException e) {
+-            ChatServer.log(who + " connection error: " + e.getMessage());
+-        } finally {
+-            server.unregister(this);
+-            close();
+-            ChatServer.log(who + " disconnected");
++        }
++    }
++
++    /**
++     * Graceful end: queue a last message (may be null), let the writer send it and then
++     * a FIN, and keep reading (discarding) for up to 1 s. Closing a socket that still
++     * has unread incoming data makes the kernel send RST, and an RST can destroy our
++     * last message before the client reads it (exactly the ERROR 413 case).
++     */
++    private void finish(String lastMessage) {
++        sendAndClose(lastMessage);
++        long deadline = System.currentTimeMillis() + 1000;
++        byte[] trash = new byte[4096];
++        try {
++            InputStream in = socket.getInputStream();
++            while (System.currentTimeMillis() < deadline) {
++                socket.setSoTimeout((int) Math.max(1, deadline - System.currentTimeMillis()));
++                if (in.read(trash) == -1) break;          // client closed too: done
++            }
++        } catch (IOException ignored) {
++            // timeout or socket closed: done either way
+         }
+     }
+ 
+@@ -65,8 +140,6 @@
+         try {
+             msg = Json.parseObject(line);
+         } catch (Json.JsonException e) {
+-            // Thanks to newline framing the NEXT line is still readable: we can
+-            // report the error and keep the connection, no need to disconnect.
+             send(Protocol.error(Protocol.BAD_REQUEST, "bad JSON: " + e.getMessage()));
+             return;
+         }
+@@ -75,7 +148,7 @@
+             send(Protocol.error(Protocol.BAD_REQUEST, "missing \"type\""));
+             return;
+         }
+-        type = type.toUpperCase(Locale.ROOT);       // liberal: "msg" works like "MSG"
++        type = type.toUpperCase(Locale.ROOT);
+ 
+         if (nick == null && !type.equals("NICK") && !type.equals("QUIT")) {
+             send(Protocol.error(Protocol.NOT_REGISTERED, "send NICK first"));
+@@ -88,7 +161,7 @@
+             case "LIST": send(Protocol.users(server.nicks())); break;
+             case "QUIT":
+                 send(Protocol.ok());
+-                quitRequested = true;               // run() closes the connection
++                quitRequested = true;
+                 break;
+             default:
+                 send(Protocol.error(Protocol.BAD_REQUEST, "unknown type '" + type + "'"));
+@@ -108,7 +181,6 @@
+         } else if (!server.register(this, requested)) {
+             send(Protocol.error(Protocol.NICK_TAKEN, "nick taken"));
+         }
+-        // on success register() already sent OK
+     }
+ 
+     private void handleMsg(Map<String, Object> msg) {
+@@ -137,21 +209,75 @@
+         send(Protocol.ok());
+     }
+ 
+-    /** Writes one message; synchronized so concurrent senders never interleave bytes. */
+-    synchronized void send(String json) {
++    // ------------------------------------------------------------------ sending (any thread)
++
++    /** Queues a message and returns immediately; never blocks the calling thread. */
++    void send(String json) {
++        if (closing.get()) return;
++        if (!outbox.offer(json)) {
++            LOG.warning(who + " is too slow (" + server.config().outboxLimit()
++                    + " messages waiting), disconnecting it");
++            closeNow();
++        }
++    }
++
++    /** Queues a last message (or null) and asks the writer to finish after it. */
++    void sendAndClose(String lastMessage) {
++        if (!closing.compareAndSet(false, true)) return;
++        boolean queued = (lastMessage == null || outbox.offer(lastMessage)) && outbox.offer(END_OF_OUTPUT);
++        if (!queued) closeNow();
++    }
++
++    // ------------------------------------------------------------------ writer thread
++
++    private void writeLoop() {
+         try {
+-            out.write((json + "\n").getBytes(StandardCharsets.UTF_8));
+-            out.flush();
+-        } catch (IOException e) {
+-            close();   // our reader thread will notice and clean up
++            OutputStream out = socket.getOutputStream();
++            while (true) {
++                String json = outbox.take();
++                if (json == END_OF_OUTPUT) {              // identity check: our own pill object
++                    socket.shutdownOutput();              // FIN: "no more data from the server"
++                    return;
++                }
++                out.write((json + "\n").getBytes(StandardCharsets.UTF_8));  // may block: only this thread
++                out.flush();
++            }
++        } catch (InterruptedException | IOException e) {
++            closeNow();                                   // client vanished: reader will notice
+         }
+     }
+ 
+-    private void close() {
++    // ------------------------------------------------------------------ closing
++
++    /** Closes immediately (idempotent, any thread). The reader then leaves its loop. */
++    void closeNow() {
++        closing.set(true);
++        if (closed.compareAndSet(false, true)) {
++            try {
++                socket.close();
++            } catch (IOException ignored) {
++                // already closed
++            }
++            writer.interrupt();                           // wakes it if it waits in take()
++            outbox.clear();
++        }
++    }
++
++    /** Waits until the reader thread has finished (used by ChatServer.stop()). */
++    void awaitFinished(long millis) {
++        join(reader, millis);
++    }
++
++    private void awaitWriter(long millis) {
++        join(writer, millis);
++    }
++
++    private static void join(Thread t, long millis) {
++        if (t == null || t == Thread.currentThread()) return;
+         try {
+-            socket.close();
+-        } catch (IOException ignored) {
+-            // already closed
++            t.join(millis);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
+         }
+     }
+ }
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/src/FramingDemo.java m4-robustness/src/FramingDemo.java
+--- m3-commands/src/FramingDemo.java	2026-10-09 17:43:44.266844478 +0000
++++ m4-robustness/src/FramingDemo.java	2026-10-09 17:46:35.048732373 +0000
+@@ -25,7 +25,7 @@
+         networkDemo(cli.get("host", "127.0.0.1"), cli.getInt("port", 12345));
+     }
+ 
+-    private static void offlineDemo() {
++    private static void offlineDemo() throws Exception {
+         System.out.println("=== Part 1: LineFramer without a network ===");
+         LineFramer framer = new LineFramer();
+         feed(framer, "{\"type\":\"MSG\",\"te");                      // partial
+@@ -34,7 +34,7 @@
+         System.out.println();
+     }
+ 
+-    private static void feed(LineFramer framer, String piece) {
++    private static void feed(LineFramer framer, String piece) throws Exception {
+         byte[] bytes = piece.getBytes(StandardCharsets.UTF_8);
+         System.out.println("feed  " + quote(piece));
+         System.out.println("  ->  " + framer.feed(bytes, bytes.length) + "   (" + framer.pending() + " bytes kept)");
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/src/LineFramer.java m4-robustness/src/LineFramer.java
+--- m3-commands/src/LineFramer.java	2026-10-09 17:43:44.266877164 +0000
++++ m4-robustness/src/LineFramer.java	2026-10-09 17:46:35.037940501 +0000
+@@ -1,3 +1,4 @@
++import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -17,14 +18,34 @@
+  * We split on the BYTE 0x0A before decoding UTF-8. That is safe because in UTF-8
+  * the byte 0x0A never occurs inside a multi-byte character, while decoding each
+  * chunk separately would break characters like "ã" or emoji cut in half by TCP.
++ *
++ * New in M4: a maximum line length. Without it, a client that never sends '\n'
++ * makes the buffer grow until the server runs out of memory.
+  */
+ public final class LineFramer {
+ 
++    /** Thrown when a message is longer than the limit. The stream cannot be trusted any more. */
++    public static final class LineTooLongException extends IOException {
++        public LineTooLongException(int limit) {
++            super("message longer than " + limit + " bytes");
++        }
++    }
++
++    private final int maxLineBytes;
+     private byte[] buffer = new byte[4096];
+     private int length = 0;                     // bytes currently waiting in the buffer
+ 
++    /** Framer with a generous 1 MiB limit (used by clients). */
++    public LineFramer() {
++        this(1 << 20);
++    }
++
++    public LineFramer(int maxLineBytes) {
++        this.maxLineBytes = maxLineBytes;
++    }
++
+     /** Adds n freshly received bytes; returns every line that is now complete. */
+-    public List<String> feed(byte[] data, int n) {
++    public List<String> feed(byte[] data, int n) throws LineTooLongException {
+         if (length + n > buffer.length) {
+             buffer = Arrays.copyOf(buffer, Math.max(length + n, buffer.length * 2));
+         }
+@@ -35,6 +56,7 @@
+         int start = 0;
+         for (int i = 0; i < length; i++) {
+             if (buffer[i] == '\n') {
++                if (i - start > maxLineBytes) throw new LineTooLongException(maxLineBytes);
+                 int end = i;
+                 if (end > start && buffer[end - 1] == '\r') end--;   // accept "\r\n" too (Windows)
+                 String line = new String(buffer, start, end - start, StandardCharsets.UTF_8);
+@@ -45,6 +67,7 @@
+         // Move the incomplete tail to the front; it waits for the next read().
+         System.arraycopy(buffer, start, buffer, 0, length - start);
+         length -= start;
++        if (length > maxLineBytes) throw new LineTooLongException(maxLineBytes);
+         return lines;
+     }
+ 
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/src/Protocol.java m4-robustness/src/Protocol.java
+--- m3-commands/src/Protocol.java	2026-10-09 17:43:44.269616157 +0000
++++ m4-robustness/src/Protocol.java	2026-10-09 17:46:35.048592311 +0000
+@@ -23,7 +23,10 @@
+     static final int BAD_REQUEST = 400;      // not JSON, unknown type, missing/invalid field
+     static final int NOT_REGISTERED = 401;   // anything except NICK/QUIT before NICK succeeded
+     static final int NO_SUCH_USER = 404;     // PRIV to a nick that is not online
++    static final int IDLE_TIMEOUT = 408;     // nothing received for too long; server closes  (new in M4)
+     static final int NICK_TAKEN = 409;       // somebody already uses this nick
++    static final int LINE_TOO_LONG = 413;    // message above the size limit; server closes  (new in M4)
++    static final int INTERNAL_ERROR = 500;   // bug in the server; the connection stays open (new in M4)
+ 
+     static final int MAX_NAME_LENGTH = 20;
+ 
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/test.sh m4-robustness/test.sh
+--- m3-commands/test.sh	1970-01-01 00:00:00.000000000 +0000
++++ m4-robustness/test.sh	2026-10-09 17:49:13.788406669 +0000
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++# Runs the Java test suite (no external libraries needed). Exit code 0 = all passed.
++cd "$(dirname "$0")"
++if [ ! -f out/.built ] || [ -n "$(find src -newer out/.built)" ]; then bash build.sh || exit 1; fi
++exec java -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -cp out ChatTests "$@"
+diff -ruN -x README.md -x CHANGES.diff -x out m3-commands/tests/test_protocol.py m4-robustness/tests/test_protocol.py
+--- m3-commands/tests/test_protocol.py	1970-01-01 00:00:00.000000000 +0000
++++ m4-robustness/tests/test_protocol.py	2026-10-09 17:51:39.074745448 +0000
+@@ -0,0 +1,235 @@
++"""
++Black-box protocol tests for pytest (the tool named in the assignment).
++
++They talk to the server ONLY through a TCP socket, exactly like any client, so they
++work against ANY implementation of the protocol, in any language:
++
++    # our Java server (built and started automatically on a free port):
++    python3 -m pytest -v tests/
++
++    # another group's server, for an interop session:
++    CHAT_HOST=192.168.1.42 CHAT_PORT=12345 python3 -m pytest -v tests/
++
++Tests marked "ours" check limits we configured on our own server (idle timeout,
++size limit); they are skipped automatically when testing someone else's server.
++"""
++import json
++import os
++import pathlib
++import socket
++import subprocess
++import time
++import uuid
++
++import pytest
++
++ROOT = pathlib.Path(__file__).resolve().parent.parent
++EXTERNAL = "CHAT_HOST" in os.environ
++ours = pytest.mark.skipif(EXTERNAL, reason="depends on our server's configuration")
++
++
++def free_port():
++    with socket.socket() as s:
++        s.bind(("127.0.0.1", 0))
++        return s.getsockname()[1]
++
++
++@pytest.fixture(scope="session")
++def server():
++    """(host, port) of the server under test."""
++    if EXTERNAL:
++        yield os.environ["CHAT_HOST"], int(os.environ.get("CHAT_PORT", "12345"))
++        return
++    subprocess.run(["bash", str(ROOT / "build.sh")], check=True, capture_output=True)
++    port = free_port()
++    proc = subprocess.Popen(
++        ["java", "-cp", str(ROOT / "out"), "ChatServer", "--port", str(port),
++         "--idle", "2", "--max-line", "4096", "--no-log-file"],
++        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    deadline = time.time() + 10
++    while True:                                   # wait until the JVM accepts connections
++        try:
++            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
++            break
++        except OSError:
++            if time.time() > deadline:
++                proc.kill()
++                raise RuntimeError("server did not start")
++            time.sleep(0.1)
++    yield "127.0.0.1", port
++    proc.terminate()                              # SIGTERM -> shutdown hook, like Ctrl+C
++    proc.wait(timeout=5)
++
++
++def unique(prefix):
++    """A fresh nick per test, so tests sharing one server never collide."""
++    return prefix + uuid.uuid4().hex[:6]
++
++
++class Client:
++    """Minimal protocol client with its own recv buffer (framing!)."""
++
++    def __init__(self, addr):
++        self.sock = socket.create_connection(addr, timeout=3)
++        self.buf = b""
++
++    def send(self, **fields):
++        self.send_raw((json.dumps(fields) + "\n").encode())   # json.dumps -> \u escapes
++
++    def send_raw(self, data):
++        self.sock.sendall(data)
++
++    def recv(self):
++        while b"\n" not in self.buf:
++            chunk = self.sock.recv(4096)
++            if not chunk:
++                raise ConnectionError("server closed the connection")
++            self.buf += chunk
++        line, self.buf = self.buf.split(b"\n", 1)
++        return json.loads(line.decode("utf-8"))
++
++    def recv_type(self, *types):
++        """Next message of one of these types; skips notifications from other tests."""
++        while True:
++            msg = self.recv()
++            if msg.get("type") in types:
++                return msg
++
++    def is_closed(self, wait=3.0):
++        self.sock.settimeout(wait)
++        try:
++            while self.sock.recv(4096):
++                pass
++            return True
++        except socket.timeout:
++            return False
++        except OSError:
++            return True
++
++    def close(self):
++        self.sock.close()
++
++
++@pytest.fixture
++def connect(server):
++    clients = []
++
++    def _connect(nick=None):
++        c = Client(server)
++        clients.append(c)
++        if nick:
++            c.send(type="NICK", nick=nick)
++            assert c.recv_type("OK", "ERROR")["type"] == "OK"
++        return c
++
++    yield _connect
++    for c in clients:
++        c.close()
++
++
++def test_nick_ok_then_joined_event(connect):
++    nick = unique("ana")
++    c = connect()
++    c.send(type="NICK", nick=nick)
++    assert c.recv()["type"] == "OK"
++    assert c.recv_type("EVENT")["text"] == nick + " joined"
++
++
++def test_duplicate_nick_any_case_is_409(connect):
++    nick = unique("Rui")
++    connect(nick)
++    other = connect()
++    other.send(type="NICK", nick=nick.lower())
++    err = other.recv_type("ERROR", "OK")
++    assert err["type"] == "ERROR" and err["code"] == 409
++
++
++def test_request_before_nick_is_401(connect):
++    c = connect()
++    c.send(type="LIST")
++    assert c.recv_type("ERROR", "USERS")["code"] == 401
++
++
++def test_broadcast_reaches_everyone_with_unicode(connect):
++    a, b = connect(unique("a")), connect(unique("b"))
++    a.send(type="MSG", text="olá ação 😀")             # sent \u-escaped by Python
++    chat = b.recv_type("CHAT")
++    assert chat["text"] == "olá ação 😀"
++    assert chat["private"] is False
++
++
++def test_private_message_and_404(connect):
++    a_nick, b_nick = unique("a"), unique("b")
++    a, b = connect(a_nick), connect(b_nick)
++    a.send(type="PRIV", to=b_nick, text="segredo")
++    chat = b.recv_type("CHAT")
++    assert chat["private"] is True and chat["from"] == a_nick
++    a.send(type="PRIV", to="nobody" + unique(""), text="x")
++    assert a.recv_type("ERROR")["code"] == 404
++
++
++def test_list_contains_both(connect):
++    a_nick, b_nick = unique("a"), unique("b")
++    a, b = connect(a_nick), connect(b_nick)
++    a.send(type="LIST")
++    nicks = a.recv_type("USERS")["nicks"]
++    assert a_nick in nicks and b_nick in nicks
++
++
++def test_bad_json_keeps_connection_open(connect):
++    c = connect(unique("c"))
++    c.send_raw(b"this is not json\n")
++    assert c.recv_type("ERROR")["code"] == 400
++    c.send(type="LIST")
++    assert c.recv_type("USERS")["type"] == "USERS"
++
++
++def test_partial_and_merged_messages(connect, server):
++    c = connect()
++    c.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    for byte in (json.dumps({"type": "NICK", "nick": unique("frag")}) + "\n").encode():
++        c.send_raw(bytes([byte]))                      # one byte per send()
++        time.sleep(0.002)
++    assert c.recv()["type"] == "OK"
++    c.send_raw(b'{"type":"MSG","text":"one"}\n{"type":"MSG","text":"two"}\n')
++    assert c.recv_type("CHAT")["text"] == "one"
++    assert c.recv_type("CHAT")["text"] == "two"
++
++
++def test_crlf_line_endings_accepted(connect):
++    c = connect()
++    c.send_raw(('{"type":"NICK","nick":"%s"}\r\n' % unique("win")).encode())
++    assert c.recv()["type"] == "OK"
++
++
++def test_abrupt_disconnect_announced(connect):
++    a = connect(unique("a"))
++    b_nick = unique("b")
++    b = connect(b_nick)
++    b.sock.close()                                     # no QUIT
++    while True:
++        ev = a.recv_type("EVENT")
++        if ev["text"] == b_nick + " left":
++            break
++
++
++def test_quit_then_closed(connect):
++    c = connect(unique("q"))
++    c.send(type="QUIT")
++    assert c.recv_type("OK")["type"] == "OK"
++    assert c.is_closed()
++
++
++@ours
++def test_idle_timeout_408(connect):
++    c = connect(unique("idle"))
++    assert c.recv_type("ERROR")["code"] == 408         # server started with --idle 2
++    assert c.is_closed()
++
++
++@ours
++def test_line_too_long_413(connect):
++    c = connect(unique("big"))
++    c.send(type="MSG", text="x" * 10000)                # server started with --max-line 4096
++    assert c.recv_type("ERROR")["code"] == 413
++    assert c.is_closed()

@@ -1,0 +1,636 @@
+# Changes from m4-robustness to m5-discovery   (generated with: diff -ruN m4-robustness m5-discovery)
+# Lines starting with + were added, - were removed. READMEs and CHANGES.diff are excluded.
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/PROTOCOL.md m5-discovery/PROTOCOL.md
+--- m4-robustness/PROTOCOL.md	2026-10-09 17:52:07.068958542 +0000
++++ m5-discovery/PROTOCOL.md	2026-10-09 17:55:08.842514111 +0000
+@@ -1,7 +1,8 @@
+-# Chat protocol specification — version M4
++# Chat protocol specification — version M5
+ 
+ This is the written spec required by milestone M3, updated in M4
+-(new: section 6 codes 408/413/500, section 7 limits and shutdown). It is meant to be shared with the
++(section 6 codes 408/413/500, section 7 limits and shutdown) and in M5
++(section 10, UDP discovery). The TCP protocol did not change in M5. It is meant to be shared with the
+ other groups: if your server or client follows it, it talks to ours.
+ 
+ The words MUST, SHOULD and MAY are used as in RFCs: MUST is required for
+@@ -166,3 +167,48 @@
+ unknown message types raw. So it still works with a server that, for example,
+ does not send `OK` after `MSG` or does not echo the sender's own `CHAT`.
+ These are the points to agree on with the other groups before testing together.
++
++## 10. UDP discovery (new in M5)
++
++Lets a client find chat servers on the local network without typing an address.
++
++**Transport.** UDP, server port **12346** by default (`--udp-port`). UDP and TCP
++ports are separate spaces; we use a different number anyway to avoid confusion.
++UDP keeps message boundaries, so each datagram is one complete message: no `\n`
++framing is needed (a trailing `\n` or spaces are allowed and ignored).
++
++**Request** (client → broadcast or a specific host, UDP port 12346). Any of:
++
++```
++{"type":"DISCOVER"}
++DISCOVER
++```
++
++The server MUST accept both (case-insensitive), because the assignment does not
++fix the format. Our client sends both, to every destination.
++
++**Reply** (server → the request's source address and port, unicast):
++
++```
++{"type":"SERVER","port":12345,"name":"java-chat-ana"}
++```
++
++- `port` (integer): the server's TCP chat port. `name` (string, optional): a label
++  to show in a list.
++- The reply contains **no IP address**: the client uses the *source address of the
++  reply datagram*. That is always an address that reached the client, even when the
++  server has several interfaces (Wi-Fi, Ethernet, VPN) or does not know its own IP.
++- A server MUST NOT answer anything that is not a DISCOVER (in particular not other
++  servers' replies), so two servers can never start a reply loop.
++
++**Client behaviour.** Send the request to `255.255.255.255`, to every interface's
++directed broadcast address (e.g. `192.168.1.255`; macOS sends `255.255.255.255`
++out of one interface only) and to `127.0.0.1`; collect replies for 1.5 s; drop
++duplicates. Our client also understands replies from other groups in other
++shapes: JSON with `port` as number or string, or plain text containing a port
++number (`PORT 12345`, `12345`).
++
++**When it does not work.** Broadcast never crosses routers, so all machines must be
++on the same subnet. University and hotel Wi-Fi often block broadcast or isolate
++clients from each other; a phone hotspot or a lab switch works. The macOS firewall
++must allow incoming connections for `java`. TCP still works with `--host <ip>`.
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/client.sh m5-discovery/client.sh
+--- m4-robustness/client.sh	2026-10-09 17:46:35.035490243 +0000
++++ m5-discovery/client.sh	2026-10-09 17:54:19.633404521 +0000
+@@ -5,4 +5,6 @@
+ if [ ! -f out/.built ] || [ -n "$(find src -newer out/.built)" ]; then bash build.sh || exit 1; fi
+ # Force UTF-8 on the terminal whatever the Java version/locale (olá, ação, emoji).
+ UTF8="-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8"
+-exec java $UTF8 -cp out ChatClient "$@"
++# M5: IPv4 only. UDP broadcast exists only in IPv4, and Java on macOS sometimes fails
++# to send to 255.255.255.255 from its default dual-stack (IPv6) socket.
++exec java $UTF8 -Djava.net.preferIPv4Stack=true -cp out ChatClient "$@"
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/demo.sh m5-discovery/demo.sh
+--- m4-robustness/demo.sh	2026-10-09 17:46:35.035500932 +0000
++++ m5-discovery/demo.sh	2026-10-09 17:54:19.645612520 +0000
+@@ -5,4 +5,6 @@
+ if [ ! -f out/.built ] || [ -n "$(find src -newer out/.built)" ]; then bash build.sh || exit 1; fi
+ # Force UTF-8 on the terminal whatever the Java version/locale (olá, ação, emoji).
+ UTF8="-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8"
+-exec java $UTF8 -cp out FramingDemo "$@"
++# M5: IPv4 only. UDP broadcast exists only in IPv4, and Java on macOS sometimes fails
++# to send to 255.255.255.255 from its default dual-stack (IPv6) socket.
++exec java $UTF8 -Djava.net.preferIPv4Stack=true -cp out FramingDemo "$@"
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/server.sh m5-discovery/server.sh
+--- m4-robustness/server.sh	2026-10-09 17:46:35.035480101 +0000
++++ m5-discovery/server.sh	2026-10-09 17:54:19.618754991 +0000
+@@ -5,4 +5,6 @@
+ if [ ! -f out/.built ] || [ -n "$(find src -newer out/.built)" ]; then bash build.sh || exit 1; fi
+ # Force UTF-8 on the terminal whatever the Java version/locale (olá, ação, emoji).
+ UTF8="-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8"
+-exec java $UTF8 -cp out ChatServer "$@"
++# M5: IPv4 only. UDP broadcast exists only in IPv4, and Java on macOS sometimes fails
++# to send to 255.255.255.255 from its default dual-stack (IPv6) socket.
++exec java $UTF8 -Djava.net.preferIPv4Stack=true -cp out ChatServer "$@"
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/src/ChatClient.java m5-discovery/src/ChatClient.java
+--- m4-robustness/src/ChatClient.java	2026-10-09 17:47:50.053465267 +0000
++++ m5-discovery/src/ChatClient.java	2026-10-09 17:54:00.329693669 +0000
+@@ -5,13 +5,15 @@
+ import java.io.OutputStream;
+ import java.net.Socket;
+ import java.nio.charset.StandardCharsets;
++import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ 
+ /**
+- * M4 chat client: commands /list, /msg, /nick, /quit, /help.
+- * New in M4: Ctrl+C sends QUIT before the program ends, so the server sees a
+- * clean goodbye instead of a reset connection.
++ * M5 chat client: commands /list, /msg, /nick, /quit, /help.
++ * M4: Ctrl+C sends QUIT before the program ends.
++ * New in M5: without --host the client FINDS servers on the LAN by UDP broadcast
++ * (ServerFinder). --scan only lists them, handy on interop day.
+  *
+  * Two threads:
+  *   - main thread:     reads the keyboard and SENDS (only this thread writes);
+@@ -20,7 +22,8 @@
+  * The client never waits for a particular reply: it prints whatever arrives.
+  * That keeps it working with servers of other groups whose replies differ a bit.
+  *
+- * Usage: java -cp out ChatClient [--host 127.0.0.1] [--port 12345] [--nick ana]
++ * Usage: java -cp out ChatClient [--host 192.168.1.20 [--port 12345]] [--nick ana] [--udp-port 12346]
++ *        java -cp out ChatClient --scan
+  */
+ public class ChatClient {
+ 
+@@ -35,9 +38,37 @@
+ 
+     public static void main(String[] args) throws Exception {
+         Cli cli = new Cli(args);
+-        String host = cli.get("host", "127.0.0.1");
+-        int port = cli.getInt("port", 12345);
+         BufferedReader keyboard = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
++        String host = cli.get("host", null);
++        int port = cli.getInt("port", 12345);
++
++        if (host == null || cli.has("scan")) {
++            int udpPort = cli.getInt("udp-port", 12346);
++            System.out.println("Looking for chat servers (UDP broadcast to port " + udpPort + ")...");
++            List<ServerFinder.Found> servers = ServerFinder.discover(udpPort, 1500);
++            for (int i = 0; i < servers.size(); i++) System.out.println("  " + (i + 1) + ") " + servers.get(i));
++            if (cli.has("scan")) return;
++            if (servers.isEmpty()) {
++                System.out.println("No server answered. Check firewall/Wi-Fi, or use --host <ip>.");
++                return;
++            }
++            int choice = 0;
++            if (servers.size() > 1) {
++                System.out.print("Connect to which one? [1-" + servers.size() + "] ");
++                String answer = keyboard.readLine();
++                try {
++                    choice = Integer.parseInt(answer.strip()) - 1;
++                } catch (RuntimeException e) {
++                    choice = -1;
++                }
++                if (choice < 0 || choice >= servers.size()) {
++                    System.out.println("No such server.");
++                    return;
++                }
++            }
++            host = servers.get(choice).host();
++            port = servers.get(choice).port();
++        }
+ 
+         String nick = cli.get("nick", null);
+         while (nick == null || nick.isBlank()) {
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/src/ChatServer.java m5-discovery/src/ChatServer.java
+--- m4-robustness/src/ChatServer.java	2026-10-09 17:51:15.783002470 +0000
++++ m5-discovery/src/ChatServer.java	2026-10-09 17:53:49.330598790 +0000
+@@ -18,25 +18,23 @@
+ import java.util.logging.Logger;
+ 
+ /**
+- * M4 - Robustness and tests.
++ * M5 - UDP discovery.
+  *
+- * What is new compared to M3:
+- *   - Config (idle timeout, max line size, outbox size) instead of constants;
+- *   - the server is an object with start()/stop(), so tests can run it in-process
+- *     on a random free port (port 0);
+- *   - Ctrl+C runs a shutdown hook: stop accepting, tell every client, close sockets;
+- *   - java.util.logging to the console AND to server.log;
+- *   - ClientHandler: idle timeout, size limit, per-client send queue (see there).
++ * What is new compared to M4: start() also starts a DiscoveryResponder, which
++ * answers UDP "DISCOVER" datagrams (default UDP port 12346) with our TCP port, so
++ * clients can find this server on the LAN without typing an IP address.
++ * Everything else (M0..M4) is unchanged.
+  *
+- * Usage: java -cp out ChatServer [--port 12345] [--idle 300] [--max-line 65536]
+- *                                [--outbox 1000] [--no-log-file]
++ * Usage: java -cp out ChatServer [--port 12345] [--udp-port 12346] [--name my-server]
++ *                                [--idle 300] [--max-line 65536] [--outbox 1000] [--no-log-file]
+  */
+ public class ChatServer {
+ 
+     static final Logger LOG = Logger.getLogger("chat");
+ 
+     /** All tunable settings in one place. Tests use small values. */
+-    record Config(int port, int idleTimeoutSeconds, int maxLineBytes, int outboxLimit) { }
++    record Config(int port, int udpPort, String name,
++                  int idleTimeoutSeconds, int maxLineBytes, int outboxLimit) { }
+ 
+     private final Config config;
+     /** Registered clients, key = nick in lower case. Guarded by synchronized (clients). */
+@@ -44,6 +42,7 @@
+     /** EVERY open connection, also before NICK, so stop() can close them all. */
+     private final Set<ClientHandler> connections = ConcurrentHashMap.newKeySet();
+     private ServerSocket serverSocket;
++    private DiscoveryResponder discovery;
+     private Thread acceptThread;
+     private volatile boolean running;
+ 
+@@ -51,6 +50,10 @@
+         Cli cli = new Cli(args);
+         Config config = new Config(
+                 cli.getInt("port", 12345),
++                cli.getInt("udp-port", 12346),
++                // Not InetAddress.getLocalHost().getHostName(): on macOS that can take
++                // 5 s (DNS lookup of the Mac's own name) and returns odd names.
++                cli.get("name", "java-chat-" + System.getProperty("user.name")),
+                 cli.getInt("idle", 300),
+                 cli.getInt("max-line", 64 * 1024),
+                 cli.getInt("outbox", 1000));
+@@ -85,8 +88,15 @@
+         running = true;
+         acceptThread = new Thread(this::acceptLoop, "accept");
+         acceptThread.start();
+-        LOG.info("listening on TCP port " + port() + " (M4: idle timeout " + config.idleTimeoutSeconds()
+-                + " s, max line " + config.maxLineBytes() + " bytes)");
++        discovery = new DiscoveryResponder(config.udpPort(), port(), config.name());
++        discovery.start();
++        LOG.info("listening on TCP port " + port() + ", discovery on UDP port " + discoveryPort()
++                + " as '" + config.name() + "' (idle timeout " + config.idleTimeoutSeconds() + " s)");
++    }
++
++    /** The real UDP discovery port (tests start it on port 0). */
++    int discoveryPort() {
++        return discovery.port();
+     }
+ 
+     /** The real port, useful when started with port 0 ("any free port"). */
+@@ -118,6 +128,7 @@
+         if (!running) return;
+         running = false;
+         LOG.info("stopping: closing " + connections.size() + " connection(s)");
++        if (discovery != null) discovery.stop();
+         try {
+             serverSocket.close();                        // unblocks accept()
+         } catch (IOException ignored) {
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/src/ChatTests.java m5-discovery/src/ChatTests.java
+--- m4-robustness/src/ChatTests.java	2026-10-09 17:50:11.349651129 +0000
++++ m5-discovery/src/ChatTests.java	2026-10-09 17:53:49.331058840 +0000
+@@ -53,6 +53,11 @@
+         test("a client that never reads cannot block the others", ChatTests::slowConsumer);
+         test("stop() (Ctrl+C) notifies and closes every client", ChatTests::shutdown);
+ 
++        // --- new in M5
++        test("discovery: JSON and plain-text DISCOVER both get our TCP port", ChatTests::discoveryReply);
++        test("discovery: ServerFinder finds a server on this machine", ChatTests::discoveryFinder);
++        test("discovery: replies in other formats are understood", ChatTests::discoveryParsing);
++
+         System.out.println();
+         System.out.println(passed + " passed, " + failed + " failed");
+         System.exit(failed == 0 ? 0 : 1);
+@@ -294,6 +299,56 @@
+         }
+     }
+ 
++    // =================================================================== M5: discovery
++
++    static void discoveryReply() throws Exception {
++        try (Server s = new Server(); java.net.DatagramSocket udp = new java.net.DatagramSocket()) {
++            udp.setSoTimeout(2000);
++            for (String probe : new String[]{"{\"type\":\"DISCOVER\"}", "DISCOVER\n", "discover"}) {
++                byte[] b = probe.getBytes(StandardCharsets.UTF_8);
++                udp.send(new java.net.DatagramPacket(b, b.length,
++                        java.net.InetAddress.getLoopbackAddress(), s.server.discoveryPort()));
++                java.net.DatagramPacket reply = new java.net.DatagramPacket(new byte[2048], 2048);
++                udp.receive(reply);
++                Map<String, Object> m = Json.parseObject(
++                        new String(reply.getData(), 0, reply.getLength(), StandardCharsets.UTF_8));
++                checkEquals("SERVER", m.get("type"));
++                checkEquals((long) s.port, m.get("port"));
++                checkEquals("test-server", m.get("name"));
++            }
++        }
++    }
++
++    static void discoveryFinder() throws Exception {
++        try (Server s = new Server()) {
++            List<ServerFinder.Found> found = ServerFinder.discover(s.server.discoveryPort(), 1000);
++            check(found.stream().anyMatch(f -> f.port() == s.port && f.name().equals("test-server")),
++                    "our server not found in " + found);
++        }
++    }
++
++    static void discoveryParsing() throws Exception {
++        java.net.InetAddress from = java.net.InetAddress.getByName("10.0.0.7");
++        String[][] cases = {
++            {"{\"type\":\"SERVER\",\"port\":5555}", "5555"},
++            {"{\"port\": \"6000\", \"name\": \"py\"}", "6000"},
++            {"PORT 7000", "7000"},
++            {"7001\n", "7001"},
++            {"DISCOVER", null},                                    // a probe, not an answer
++            {"hello", null},
++        };
++        for (String[] c : cases) {
++            byte[] b = c[0].getBytes(StandardCharsets.UTF_8);
++            ServerFinder.Found f = ServerFinder.parseReply(new java.net.DatagramPacket(b, b.length, from, 1));
++            if (c[1] == null) {
++                check(f == null, "should be ignored: " + c[0]);
++            } else {
++                check(f != null && f.port() == Integer.parseInt(c[1]) && f.host().equals("10.0.0.7"),
++                        "bad parse of " + c[0] + " -> " + f);
++            }
++        }
++    }
++
+     // =================================================================== tiny test framework
+ 
+     interface TestBody {
+@@ -341,7 +396,7 @@
+         }
+ 
+         Server(int idleSeconds, int maxLine, int outbox) throws IOException {
+-            server = new ChatServer(new ChatServer.Config(0, idleSeconds, maxLine, outbox));
++            server = new ChatServer(new ChatServer.Config(0, 0, "test-server", idleSeconds, maxLine, outbox));
+             server.start();
+             port = server.port();
+         }
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/src/DiscoveryResponder.java m5-discovery/src/DiscoveryResponder.java
+--- m4-robustness/src/DiscoveryResponder.java	1970-01-01 00:00:00.000000000 +0000
++++ m5-discovery/src/DiscoveryResponder.java	2026-10-09 17:52:29.366748437 +0000
+@@ -0,0 +1,94 @@
++import java.io.IOException;
++import java.net.DatagramPacket;
++import java.net.DatagramSocket;
++import java.net.InetSocketAddress;
++import java.net.SocketException;
++import java.nio.charset.StandardCharsets;
++import java.util.Map;
++import java.util.logging.Logger;
++
++/**
++ * M5 - server side of UDP discovery.
++ *
++ * Listens on a UDP port (default 12346) on all interfaces. When a datagram saying
++ * DISCOVER arrives (usually sent to the broadcast address by a client that does not
++ * know where the server is), it answers the sender directly (unicast) with
++ *
++ *     {"type":"SERVER","port":12345,"name":"java-chat-ana"}
++ *
++ * The reply does NOT contain our IP address: the client reads it from the source
++ * address of the reply packet. That is always the address that actually reached the
++ * client, even if this machine has several interfaces (Wi-Fi, Ethernet, VPN...).
++ *
++ * UDP keeps message boundaries (one send = one datagram = one receive), so unlike
++ * TCP no framing or buffer is needed here.
++ */
++final class DiscoveryResponder implements Runnable {
++
++    private static final Logger LOG = ChatServer.LOG;
++
++    private final int tcpPort;
++    private final String name;
++    private final DatagramSocket socket;
++
++    DiscoveryResponder(int udpPort, int tcpPort, String name) throws SocketException {
++        this.tcpPort = tcpPort;
++        this.name = name;
++        socket = new DatagramSocket(null);          // unbound, so we can set options first
++        socket.setReuseAddress(true);
++        socket.bind(new InetSocketAddress(udpPort)); // all interfaces: receives broadcasts too
++    }
++
++    int port() {
++        return socket.getLocalPort();
++    }
++
++    void start() {
++        Thread t = new Thread(this, "discovery");
++        t.setDaemon(true);
++        t.start();
++    }
++
++    void stop() {
++        socket.close();                              // unblocks receive()
++    }
++
++    @Override
++    public void run() {
++        byte[] buffer = new byte[2048];
++        while (!socket.isClosed()) {
++            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
++            try {
++                socket.receive(packet);
++                String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
++                        StandardCharsets.UTF_8).trim();
++                if (!isDiscover(text)) {
++                    LOG.fine("discovery: ignored datagram from " + packet.getSocketAddress());
++                    continue;                        // never answer answers: no packet storms
++                }
++                byte[] reply = Json.write(Json.obj("type", "SERVER", "port", tcpPort, "name", name))
++                        .getBytes(StandardCharsets.UTF_8);
++                socket.send(new DatagramPacket(reply, reply.length, packet.getSocketAddress()));
++                LOG.info("discovery: answered " + packet.getSocketAddress());
++            } catch (IOException e) {
++                if (!socket.isClosed()) LOG.warning("discovery: " + e.getMessage());
++            }
++        }
++    }
++
++    /**
++     * The assignment does not fix the request format, so we accept every reasonable
++     * dialect: plain text "DISCOVER" (any case, with or without "\n") or a JSON
++     * object {"type":"DISCOVER"}.
++     */
++    static boolean isDiscover(String text) {
++        if (text.equalsIgnoreCase("DISCOVER")) return true;
++        try {
++            Map<String, Object> msg = Json.parseObject(text);
++            String type = Json.getString(msg, "type");
++            return type != null && type.equalsIgnoreCase("DISCOVER");
++        } catch (Json.JsonException e) {
++            return false;
++        }
++    }
++}
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/src/ServerFinder.java m5-discovery/src/ServerFinder.java
+--- m4-robustness/src/ServerFinder.java	1970-01-01 00:00:00.000000000 +0000
++++ m5-discovery/src/ServerFinder.java	2026-10-09 17:53:28.010751923 +0000
+@@ -0,0 +1,141 @@
++import java.io.IOException;
++import java.net.DatagramPacket;
++import java.net.DatagramSocket;
++import java.net.Inet4Address;
++import java.net.InetAddress;
++import java.net.InterfaceAddress;
++import java.net.NetworkInterface;
++import java.net.SocketTimeoutException;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * M5 - client side of UDP discovery: "which chat servers are on this LAN?"
++ *
++ * Sends DISCOVER to several destinations at once and collects every answer that
++ * arrives within a short time:
++ *   - 255.255.255.255         the "limited broadcast" (every host on this link);
++ *   - each interface's own broadcast address, e.g. 192.168.1.255 -- some systems
++ *     (macOS included) only send 255.255.255.255 out of ONE interface;
++ *   - 127.0.0.1               a server on this same Mac, even with Wi-Fi off.
++ *
++ * Each destination gets the request in two dialects, JSON {"type":"DISCOVER"} and
++ * plain text DISCOVER, because the assignment does not fix the format and other
++ * groups may have chosen either. Duplicate answers are merged.
++ */
++final class ServerFinder {
++
++    /** One server that answered. host comes from the packet, never from its content. */
++    record Found(String host, int port, String name) {
++        @Override
++        public String toString() {
++            return host + ":" + port + (name.isEmpty() ? "" : "  (" + name + ")");
++        }
++    }
++
++    private ServerFinder() { }
++
++    static List<Found> discover(int udpPort, int waitMillis) throws IOException {
++        Map<String, Found> found = new LinkedHashMap<>();
++        try (DatagramSocket socket = new DatagramSocket()) {   // any free local port
++            socket.setBroadcast(true);                        // SO_BROADCAST: needed to send to x.x.x.255
++            byte[][] probes = {
++                Json.write(Json.obj("type", "DISCOVER")).getBytes(StandardCharsets.UTF_8),
++                "DISCOVER".getBytes(StandardCharsets.UTF_8),
++            };
++            for (InetAddress target : targets()) {
++                for (byte[] probe : probes) {
++                    try {
++                        socket.send(new DatagramPacket(probe, probe.length, target, udpPort));
++                    } catch (IOException e) {
++                        // e.g. "No route to host" for a destination with no network: try the others
++                    }
++                }
++            }
++
++            byte[] buffer = new byte[2048];
++            long deadline = System.currentTimeMillis() + waitMillis;
++            while (true) {
++                long left = deadline - System.currentTimeMillis();
++                if (left <= 0) break;
++                socket.setSoTimeout((int) left);
++                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
++                try {
++                    socket.receive(packet);
++                } catch (SocketTimeoutException timeIsUp) {
++                    break;
++                }
++                Found f = parseReply(packet);
++                if (f != null) found.putIfAbsent(f.host() + ":" + f.port(), f);
++            }
++        }
++        return withoutLocalDuplicates(new ArrayList<>(found.values()));
++    }
++
++    /** Where to send DISCOVER. */
++    static Set<InetAddress> targets() throws IOException {
++        Set<InetAddress> targets = new LinkedHashSet<>();
++        targets.add(InetAddress.getByName("255.255.255.255"));
++        for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
++            if (!nif.isUp() || nif.isLoopback()) continue;
++            for (InterfaceAddress ia : nif.getInterfaceAddresses()) {
++                if (ia.getAddress() instanceof Inet4Address && ia.getBroadcast() != null) {
++                    targets.add(ia.getBroadcast());               // e.g. 192.168.1.255 for en0
++                }
++            }
++        }
++        targets.add(InetAddress.getByName("127.0.0.1"));
++        return targets;
++    }
++
++    private static final Pattern NUMBER = Pattern.compile("\\b(\\d{1,5})\\b");
++
++    /**
++     * Liberal reply parsing: JSON with a "port" field (number or string), or any text
++     * containing a port number ("PORT 12345", "12345"). null if it is not a reply.
++     */
++    static Found parseReply(DatagramPacket packet) {
++        String text = new String(packet.getData(), packet.getOffset(), packet.getLength(),
++                StandardCharsets.UTF_8).trim();
++        String host = packet.getAddress().getHostAddress();
++        if (DiscoveryResponder.isDiscover(text)) return null;      // someone else's probe, not an answer
++        Integer port = null;
++        String name = "";
++        try {
++            Map<String, Object> msg = Json.parseObject(text);
++            Object p = msg.get("port");
++            if (p instanceof Number) port = ((Number) p).intValue();
++            if (p instanceof String) port = Integer.parseInt(((String) p).trim());
++            Object n = msg.get("name");
++            if (n != null) name = String.valueOf(n);
++        } catch (Json.JsonException | NumberFormatException notJson) {
++            Matcher m = NUMBER.matcher(text);
++            if (m.find()) port = Integer.parseInt(m.group(1));
++        }
++        if (port == null || port < 1 || port > 65535) return null;
++        return new Found(host, port, name);
++    }
++
++    /**
++     * A server on this Mac answers twice: via 127.0.0.1 and via its LAN address.
++     * Keep only the LAN entry, since that is the address other people can use too.
++     */
++    private static List<Found> withoutLocalDuplicates(List<Found> all) {
++        List<Found> result = new ArrayList<>();
++        for (Found f : all) {
++            boolean loopback = f.host().startsWith("127.");
++            boolean alsoOnLan = all.stream().anyMatch(o -> !o.host().startsWith("127.")
++                    && o.port() == f.port() && o.name().equals(f.name()) && !o.name().isEmpty());
++            if (!(loopback && alsoOnLan)) result.add(f);
++        }
++        return result;
++    }
++}
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/test.sh m5-discovery/test.sh
+--- m4-robustness/test.sh	2026-10-09 17:49:13.788406669 +0000
++++ m5-discovery/test.sh	2026-10-09 17:54:19.648995060 +0000
+@@ -2,4 +2,4 @@
+ # Runs the Java test suite (no external libraries needed). Exit code 0 = all passed.
+ cd "$(dirname "$0")"
+ if [ ! -f out/.built ] || [ -n "$(find src -newer out/.built)" ]; then bash build.sh || exit 1; fi
+-exec java -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -cp out ChatTests "$@"
++exec java -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -cp out ChatTests "$@"
+diff -ruN -x README.md -x CHANGES.diff -x out m4-robustness/tests/test_protocol.py m5-discovery/tests/test_protocol.py
+--- m4-robustness/tests/test_protocol.py	2026-10-09 17:51:39.074745448 +0000
++++ m5-discovery/tests/test_protocol.py	2026-10-09 17:54:52.466318507 +0000
+@@ -8,7 +8,7 @@
+     python3 -m pytest -v tests/
+ 
+     # another group's server, for an interop session:
+-    CHAT_HOST=192.168.1.42 CHAT_PORT=12345 python3 -m pytest -v tests/
++    CHAT_HOST=192.168.1.42 CHAT_PORT=12345 CHAT_UDP_PORT=12346 python3 -m pytest -v tests/
+ 
+ Tests marked "ours" check limits we configured on our own server (idle timeout,
+ size limit); they are skipped automatically when testing someone else's server.
+@@ -25,6 +25,7 @@
+ 
+ ROOT = pathlib.Path(__file__).resolve().parent.parent
+ EXTERNAL = "CHAT_HOST" in os.environ
++UDP = {"port": int(os.environ.get("CHAT_UDP_PORT", "12346"))}   # filled in by the fixture
+ ours = pytest.mark.skipif(EXTERNAL, reason="depends on our server's configuration")
+ 
+ 
+@@ -42,8 +43,10 @@
+         return
+     subprocess.run(["bash", str(ROOT / "build.sh")], check=True, capture_output=True)
+     port = free_port()
++    UDP["port"] = free_port()
+     proc = subprocess.Popen(
+-        ["java", "-cp", str(ROOT / "out"), "ChatServer", "--port", str(port),
++        ["java", "-Djava.net.preferIPv4Stack=true", "-cp", str(ROOT / "out"), "ChatServer",
++         "--port", str(port), "--udp-port", str(UDP["port"]),
+          "--idle", "2", "--max-line", "4096", "--no-log-file"],
+         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+     deadline = time.time() + 10
+@@ -233,3 +236,17 @@
+     c.send(type="MSG", text="x" * 10000)                # server started with --max-line 4096
+     assert c.recv_type("ERROR")["code"] == 413
+     assert c.is_closed()
++
++
++# ----------------------------------------------------------------- M5: UDP discovery
++
++@pytest.mark.parametrize("probe", [b'{"type":"DISCOVER"}', b"DISCOVER", b"DISCOVER\n"])
++def test_discovery_answers_with_tcp_port(server, probe):
++    host, tcp_port = server
++    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
++        udp.settimeout(2)
++        udp.sendto(probe, (host, UDP["port"]))      # unicast here; clients broadcast
++        data, sender = udp.recvfrom(2048)
++    reply = json.loads(data.decode("utf-8"))
++    assert int(reply["port"]) == tcp_port
++    assert sender[0] == socket.gethostbyname(host)   # the IP comes from the packet itself

@@ -1,0 +1,11 @@
+2026-10-09 19:58:48.322 INFO    [main] listening on TCP port 12345, discovery on UDP port 12346 as 'ana-mac' (idle timeout 300 s)
+2026-10-09 19:59:07.949 INFO    [discovery] discovery: answered /127.0.0.1:60439
+2026-10-09 19:59:07.950 INFO    [discovery] discovery: answered /127.0.0.1:60439
+2026-10-09 19:59:07.956 INFO    [discovery] discovery: answered /192.168.1.7:60439
+2026-10-09 19:59:07.956 INFO    [discovery] discovery: answered /192.168.1.7:60439
+2026-10-09 19:59:22.294 INFO    [discovery] discovery: answered /127.0.0.1:53314
+2026-10-09 19:59:22.294 INFO    [discovery] discovery: answered /127.0.0.1:53314
+2026-10-09 19:59:22.296 INFO    [discovery] discovery: answered /192.168.1.7:53314
+2026-10-09 19:59:22.296 INFO    [discovery] discovery: answered /192.168.1.7:53314
+2026-10-09 19:59:23.831 INFO    [client-/192.168.1.7:50207] /192.168.1.7:50207 connected
+2026-10-09 19:59:23.838 INFO    [client-/192.168.1.7:50207] rui joined (1 online)
